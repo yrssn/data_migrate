@@ -30,6 +30,7 @@ from .platform_filter_widget import PlatformFilterWidget
 from .rlb_company_info_widget import RlbCompanyInfoWidget
 from .customer_info_complete_widget import CustomerInfoCompleteWidget
 from .customer_status_fix_widget import CustomerStatusFixWidget
+from .inventory_status_update_widget import InventoryStatusUpdateWidget
 
 
 class MainWindow(QMainWindow):
@@ -176,6 +177,7 @@ class MainWindow(QMainWindow):
         self.function_combo.addItem("补全日联部企业基础信息表", "rlb_company_info")
         self.function_combo.addItem("补全客户信息字段初始值", "customer_info_complete")
         self.function_combo.addItem("修正is_customer字段", "customer_status_fix")
+        self.function_combo.addItem("按库存主键更新状态", "inventory_status_update")
         self.function_combo.addItem("数据库表迁移（待开发）", "db_migrate")
         self.function_combo.addItem("数据格式转换（待开发）", "format_convert")
         self.function_combo.currentTextChanged.connect(self.on_function_changed)
@@ -268,6 +270,10 @@ class MainWindow(QMainWindow):
         self.customer_status_fix_widget = CustomerStatusFixWidget(self.db_manager)
         self.function_stack.addWidget(self.customer_status_fix_widget)
         
+        # 按库存主键更新状态功能
+        self.inventory_status_update_widget = InventoryStatusUpdateWidget(self.db_manager)
+        self.function_stack.addWidget(self.inventory_status_update_widget)
+        
         # 占位页面（其他功能）
         placeholder_widget = QWidget()
         placeholder_layout = QVBoxLayout()
@@ -325,8 +331,10 @@ class MainWindow(QMainWindow):
             self.function_stack.setCurrentIndex(18)
         elif "修正is_customer字段" in text:
             self.function_stack.setCurrentIndex(19)
-        else:
+        elif "按库存主键更新状态" in text:
             self.function_stack.setCurrentIndex(20)
+        else:
+            self.function_stack.setCurrentIndex(21)
     
     def load_datasources(self):
         """加载数据源列表"""
