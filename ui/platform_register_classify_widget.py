@@ -227,7 +227,7 @@ class PlatformRegisterClassifyWorker(QThread):
                 
                 if key not in self.sheet1_keys:
                     self.log_message.emit(f"第{row_num}行: 法人'{b_col}'和平台'{d_col}'匹配，放入sheet1")
-                    self.add_to_sheet1(row, columns, shop_record)
+                    self.add_to_sheet1(row, columns, shop_record, cursor)
                     self.sheet1_keys.add(key)
                 else:
                     self.log_message.emit(f"第{row_num}行: 法人'{b_col}'和平台'{d_col}'已存在于sheet1，跳过")
@@ -271,11 +271,11 @@ class PlatformRegisterClassifyWorker(QThread):
                 
                 record = cursor.fetchone()
                 if record:
-                    self.add_to_sheet2_from_db(record)
+                    self.add_to_sheet2_from_db(record, cursor)
                     self.sheet2_keys.add(key)
                     self.log_message.emit(f"数据库独有: 法人'{legal_name}'和平台'{platform_name}'，放入sheet2")
     
-    def add_to_sheet1(self, row, columns, shop):
+    def add_to_sheet1(self, row, columns, shop, cursor):
         """添加数据到sheet1（平台注册部数据在财务系统中）"""
         # 原始Excel数据
         data = {}
@@ -294,26 +294,71 @@ class PlatformRegisterClassifyWorker(QThread):
         
         # 状态转换
         status = shop.get('status', 1)
-        status_map = {
-            0: '暂停',
-            1: '正常',
-            2: '已闭店',
-            3: '已退店',
-            4: '退店申请中',
-            5: '闭店申请中',
-            6: '闭店回款中',
-            7: '退店回款中'
-        }
-        converted_status = status_map.get(status, '未知')
-        data['店铺状态'] = converted_status
+        shop_id = shop.get('id')
         
-        # 添加调试信息
-        if status == 3:
-            print(f"DEBUG: 发现已退店状态 - 原始值:{status}, 转换后:{converted_status}")
+        # 获取状态文本
+        status_text = self.get_shop_status_text(cursor, status, shop_id)
+        data['店铺状态'] = status_text
         
         self.sheet1_data.append(data)
     
-    def add_to_sheet2_from_db(self, record):
+    def get_shop_status_text(self, cursor, status, shop_id):
+        """获取店铺状态文本，处理status=2的特殊情况"""
+        # 基本状态映射
+        basic_status_map = {
+            0: '暂停',
+            1: '正常'
+        }
+        
+        # 如果不是status=2，直接返回基本状态
+        if status != 2:
+            return basic_status_map.get(status, f'未知状态({status})')
+        
+        # status=2时，查询ea_dy_shop_dead_apply表获取详细状态
+        try:
+            cursor.execute("""
+                SELECT type, status
+                FROM ea_dy_shop_dead_apply 
+                WHERE shop_id = %s AND (delete_time IS NULL OR delete_time = 0)
+                ORDER BY create_time DESC 
+                LIMIT 1
+            """, (shop_id,))
+            
+            dead_apply_record = cursor.fetchone()
+            
+            if dead_apply_record:
+                dead_type = dead_apply_record.get('type')
+                dead_status = dead_apply_record.get('status')
+                
+                if dead_type == 1:  # 死店
+                    if dead_status == 0:
+                        return '闭店申请中'
+                    elif dead_status == 1:
+                        return '闭店回款中'
+                    elif dead_status == 2:
+                        return '已闭店'
+                    else:
+                        return '已闭店'  # 默认
+                elif dead_type == 2:  # 退店
+                    if dead_status == 0:
+                        return '退店申请中'
+                    elif dead_status == 1:
+                        return '退店回款中'
+                    elif dead_status == 2:
+                        return '已退店'
+                    else:
+                        return '已退店'  # 默认
+                else:
+                    return '已闭店'  # 默认为闭店
+            else:
+                # 没有找到dead_apply记录，默认为已闭店
+                return '已闭店'
+                
+        except Exception as e:
+            # 查询出错，返回默认状态
+            return '已闭店'
+    
+    def add_to_sheet2_from_db(self, record, cursor):
         """从数据库记录添加数据到sheet2（日联部店铺）"""
         data = {
             '法人姓名': record.get('legal_name', ''),
@@ -330,17 +375,11 @@ class PlatformRegisterClassifyWorker(QThread):
         
         # 状态转换
         status = record.get('status', 1)
-        status_map = {
-            0: '暂停',
-            1: '正常',
-            2: '已闭店',
-            3: '已退店',
-            4: '退店申请中',
-            5: '闭店申请中',
-            6: '闭店回款中',
-            7: '退店回款中'
-        }
-        data['店铺状态'] = status_map.get(status, '未知')
+        shop_id = record.get('id')  # 注意这里是s.id，不是legal_id
+        
+        # 获取状态文本
+        status_text = self.get_shop_status_text(cursor, status, shop_id)
+        data['店铺状态'] = status_text
         
         self.sheet2_data.append(data)
     
