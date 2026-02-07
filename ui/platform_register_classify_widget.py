@@ -190,8 +190,8 @@ class PlatformRegisterClassifyWorker(QThread):
             self.add_to_sheet3_original(row, columns)
             return
         
-        legal_id = legal_record[0]  # id字段
-        legal_name = legal_record[1]  # name字段
+        legal_id = legal_record['id']
+        legal_name = legal_record['name']
         
         # 检查这个法人-平台组合是否在数据库中存在
         if not d_col:
@@ -221,13 +221,9 @@ class PlatformRegisterClassifyWorker(QThread):
             
             if shop_record:
                 key = (b_col, d_col)
-                # 添加调试信息：显示查询结果长度和状态值
-                self.log_message.emit(f"第{row_num}行: 查询结果字段数={len(shop_record)}")
-                if len(shop_record) > 12:
-                    status_value = shop_record[12]  # status字段在查询结果中的索引
-                    self.log_message.emit(f"第{row_num}行: 查询到状态值={status_value} (类型:{type(status_value)})")
-                else:
-                    self.log_message.emit(f"第{row_num}行: 查询结果字段不足，无法获取状态值")
+                # 添加调试信息：显示查询到的状态值
+                status_value = shop_record.get('status', 'N/A')
+                self.log_message.emit(f"第{row_num}行: 查询到状态值={status_value} (类型:{type(status_value)})")
                 
                 if key not in self.sheet1_keys:
                     self.log_message.emit(f"第{row_num}行: 法人'{b_col}'和平台'{d_col}'匹配，放入sheet1")
@@ -286,24 +282,29 @@ class PlatformRegisterClassifyWorker(QThread):
         for i, col in enumerate(columns):
             data[col] = row.iloc[i] if i < len(row) else ""
         
-        # 添加额外字段（shop是元组，按索引访问）
-        data['渠道'] = shop[4] if len(shop) > 4 else ''  # s.channel
-        data['担当'] = shop[5] if len(shop) > 5 else ''  # s.charge
-        data['介绍人'] = shop[6] if len(shop) > 6 else ''  # s.referrer
-        data['拿店月份'] = shop[7] if len(shop) > 7 else ''  # s.storeAcquisitionMonth
-        data['拿店日期'] = shop[8] if len(shop) > 8 else ''  # s.storeAcquisitionDate
-        data['给店月份'] = shop[9] if len(shop) > 9 else ''  # s.storeApprovalMonth
-        data['拿店审批号'] = shop[10] if len(shop) > 10 else ''  # s.storeAcquisitionApprovalId
-        data['给店审批号'] = shop[11] if len(shop) > 11 else ''  # s.storeApprovalId
+        # 添加额外字段
+        data['渠道'] = shop.get('channel', '')
+        data['担当'] = shop.get('charge', '')
+        data['介绍人'] = shop.get('referrer', '')
+        data['拿店月份'] = shop.get('storeAcquisitionMonth', '')
+        data['拿店日期'] = shop.get('storeAcquisitionDate', '')
+        data['给店月份'] = shop.get('storeApprovalMonth', '')
+        data['拿店审批号'] = shop.get('storeAcquisitionApprovalId', '')
+        data['给店审批号'] = shop.get('storeApprovalId', '')
         
         # 状态转换
-        status = shop[12] if len(shop) > 12 else 1  # s.status
+        status = shop.get('status', 1)
         status_map = {
             0: '暂停',
             1: '正常',
-            2: '已死店'
+            2: '已闭店',
+            3: '已退店',
+            4: '退店申请中',
+            5: '闭店申请中',
+            6: '闭店回款中',
+            7: '退店回款中'
         }
-        converted_status = status_map.get(status, f'未知状态({status})')
+        converted_status = status_map.get(status, '未知')
         data['店铺状态'] = converted_status
         
         # 添加调试信息
@@ -315,26 +316,31 @@ class PlatformRegisterClassifyWorker(QThread):
     def add_to_sheet2_from_db(self, record):
         """从数据库记录添加数据到sheet2（日联部店铺）"""
         data = {
-            '法人姓名': record[1] if len(record) > 1 else '',  # l.name as legal_name
-            '店铺类型': record[13] if len(record) > 13 else '',  # st.name as platform_name
-            '渠道': record[4] if len(record) > 4 else '',  # s.channel
-            '担当': record[5] if len(record) > 5 else '',  # s.charge
-            '介绍人': record[6] if len(record) > 6 else '',  # s.referrer
-            '拿店月份': record[7] if len(record) > 7 else '',  # s.storeAcquisitionMonth
-            '拿店日期': record[8] if len(record) > 8 else '',  # s.storeAcquisitionDate
-            '给店月份': record[9] if len(record) > 9 else '',  # s.storeApprovalMonth
-            '拿店审批号': record[10] if len(record) > 10 else '',  # s.storeAcquisitionApprovalId
-            '给店审批号': record[11] if len(record) > 11 else '',  # s.storeApprovalId
+            '法人姓名': record.get('legal_name', ''),
+            '店铺类型': record.get('platform_name', ''),
+            '渠道': record.get('channel', ''),
+            '担当': record.get('charge', ''),
+            '介绍人': record.get('referrer', ''),
+            '拿店月份': record.get('storeAcquisitionMonth', ''),
+            '拿店日期': record.get('storeAcquisitionDate', ''),
+            '给店月份': record.get('storeApprovalMonth', ''),
+            '拿店审批号': record.get('storeAcquisitionApprovalId', ''),
+            '给店审批号': record.get('storeApprovalId', ''),
         }
         
         # 状态转换
-        status = record[12] if len(record) > 12 else 1  # s.status
+        status = record.get('status', 1)
         status_map = {
             0: '暂停',
             1: '正常',
-            2: '已死店'
+            2: '已闭店',
+            3: '已退店',
+            4: '退店申请中',
+            5: '闭店申请中',
+            6: '闭店回款中',
+            7: '退店回款中'
         }
-        data['店铺状态'] = status_map.get(status, f'未知状态({status})')
+        data['店铺状态'] = status_map.get(status, '未知')
         
         self.sheet2_data.append(data)
     
