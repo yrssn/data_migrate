@@ -32,6 +32,7 @@ from .customer_info_complete_widget import CustomerInfoCompleteWidget
 from .customer_status_fix_widget import CustomerStatusFixWidget
 from .inventory_status_update_widget import InventoryStatusUpdateWidget
 from .excel_json_format_widget import ExcelJsonFormatWidget
+from .platform_info_fill_widget import PlatformInfoFillWidget
 
 
 class MainWindow(QMainWindow):
@@ -180,8 +181,9 @@ class MainWindow(QMainWindow):
         self.function_combo.addItem("修正is_customer字段", "customer_status_fix")
         self.function_combo.addItem("按库存主键更新状态", "inventory_status_update")
         self.function_combo.addItem("Excel JSON格式转换", "excel_json_format")
-        self.function_combo.addItem("数据库表迁移（待开发）", "db_migrate")
-        self.function_combo.addItem("数据格式转换（待开发）", "format_convert")
+        self.function_combo.addItem("补全单个主体编号的平台详情", "platform_info_fill")
+        # self.function_combo.addItem("数据库表迁移（待开发）", "db_migrate")
+        # self.function_combo.addItem("数据格式转换（待开发）", "format_convert")
         self.function_combo.currentTextChanged.connect(self.on_function_changed)
         function_layout.addWidget(self.function_combo)
         
@@ -280,6 +282,10 @@ class MainWindow(QMainWindow):
         self.excel_json_format_widget = ExcelJsonFormatWidget(self.db_manager)
         self.function_stack.addWidget(self.excel_json_format_widget)
         
+        # 补全单个主体编号的平台详情功能
+        self.platform_info_fill_widget = PlatformInfoFillWidget(self.db_manager)
+        self.function_stack.addWidget(self.platform_info_fill_widget)
+        
         # 占位页面（其他功能）
         placeholder_widget = QWidget()
         placeholder_layout = QVBoxLayout()
@@ -341,8 +347,10 @@ class MainWindow(QMainWindow):
             self.function_stack.setCurrentIndex(20)
         elif "Excel JSON格式转换" in text:
             self.function_stack.setCurrentIndex(21)
-        else:
+        elif "补全单个主体编号的平台详情" in text:
             self.function_stack.setCurrentIndex(22)
+        else:
+            self.function_stack.setCurrentIndex(23)
     
     def load_datasources(self):
         """加载数据源列表"""
