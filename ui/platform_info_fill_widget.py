@@ -1,12 +1,13 @@
 """
-补全单个主体编号的平台详情功能界面
+补全主体编号的平台详情功能界面
+支持全部主体或指定单个主体，可选择要补全的平台
 """
 import time
 from datetime import datetime
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
                              QPushButton, QLabel, QMessageBox, QComboBox,
                              QGroupBox, QProgressBar, QTextEdit, QLineEdit,
-                             QCheckBox, QScrollArea, QFrame)
+                             QCheckBox, QScrollArea, QRadioButton, QButtonGroup)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
 from database import DatabaseManager
@@ -62,22 +63,23 @@ class LoadPlatformWorker(QThread):
 
 
 class PreCheckWorker(QThread):
-    """预检查工作线程 - 只查询不写入"""
+    """Pre-check worker: read-only check of missing combinations."""
     progress = pyqtSignal(int)
     log_message = pyqtSignal(str)
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
 
-    def __init__(self, datasource, db_manager, shopindex_id_str, selected_platforms):
+    def __init__(self, datasource, db_manager, selected_platforms, scope_all=True, shopindex_id_str=''):
         super().__init__()
         self.datasource = datasource
         self.db_manager = db_manager
+        self.selected_platforms = selected_platforms
+        self.scope_all = scope_all
         self.shopindex_id_str = shopindex_id_str.strip()
-        self.selected_platforms = selected_platforms  # list of (id, platform, financial_platform, code)
 
     def run(self):
         try:
-            self.log_message.emit("【预检查】开始连接数据库...")
+            self.log_message.emit("[PreCheck] Connecting to database...")
             self.progress.emit(5)
 
             connection = pymysql.connect(
@@ -89,141 +91,138 @@ class PreCheckWorker(QThread):
                 charset=self.datasource.charset
             )
             cursor = connection.cursor()
-            self.log_message.emit("【预检查】数据库连接成功")
+            self.log_message.emit("[PreCheck] Connected")
             self.progress.emit(10)
 
-            # 第一步：查找主体编号
-            self.log_message.emit(f"【预检查】正在查找主体编号: {self.shopindex_id_str}")
-            cursor.execute("""
-                SELECT id, shopindex_id, `select`, legal_id 
-                FROM ba_shopindex 
-                WHERE shopindex_id = %s AND (delete_time IS NULL OR delete_time = 0)
-            """, (self.shopindex_id_str,))
-            shopindex_result = cursor.fetchone()
+            if self.scope_all:
+                cursor.execute("""
+                    SELECT id, shopindex_id, admin_id, admin_dept_id
+                    FROM ba_shopindex
+                    WHERE status = 1 AND (delete_time IS NULL OR delete_time = 0)
+                    ORDER BY id
+                """)
+            else:
+                cursor.execute("""
+                    SELECT id, shopindex_id, admin_id, admin_dept_id
+                    FROM ba_shopindex
+                    WHERE shopindex_id = %s AND (delete_time IS NULL OR delete_time = 0)
+                """, (self.shopindex_id_str,))
 
-            if not shopindex_result:
-                self.error.emit(f"未找到主体编号: {self.shopindex_id_str}")
+            shopindex_records = cursor.fetchall()
+            if not shopindex_records:
                 cursor.close()
                 connection.close()
+                if self.scope_all:
+                    self.error.emit("No active shopindex records found")
+                else:
+                    self.error.emit(f"Shopindex not found: {self.shopindex_id_str}")
                 return
 
-            shopindex_pk = shopindex_result[0]
-            shopindex_id_val = shopindex_result[1]
-            shopindex_select = shopindex_result[2]
-            shopindex_legal_id = shopindex_result[3]
-            self.log_message.emit(
-                f"【预检查】找到主体: id={shopindex_pk}, 编号={shopindex_id_val}, "
-                f"属性={shopindex_select}, 法人/客户ID={shopindex_legal_id}"
-            )
-            self.progress.emit(20)
-
-            # 第二步：获取所有启用的ba_shudi记录
-            self.log_message.emit("【预检查】正在获取所有属地信息...")
+            self.progress.emit(15)
             cursor.execute("""
-                SELECT id, territory_name, territory_abbreviation 
-                FROM ba_shudi 
+                SELECT id, territory_name, territory_abbreviation
+                FROM ba_shudi
                 WHERE status = 1
                 ORDER BY id
             """)
             shudi_list = cursor.fetchall()
-
             if not shudi_list:
-                self.error.emit("未找到任何启用的属地记录")
                 cursor.close()
                 connection.close()
+                self.error.emit("No active shudi records found")
                 return
 
-            self.log_message.emit(f"【预检查】找到 {len(shudi_list)} 个属地")
-            for s in shudi_list:
-                self.log_message.emit(f"  属地ID={s[0]}, 名称={s[1]}, 简称={s[2]}")
-            self.progress.emit(30)
-
-            # 第三步：使用用户选择的平台列表
+            self.progress.emit(20)
             platform_list = self.selected_platforms
-            self.log_message.emit(f"【预检查】用户选择了 {len(platform_list)} 个平台")
-            for p in platform_list:
-                self.log_message.emit(f"  平台ID={p[0]}, 标识={p[1]}, 财务平台={p[2]}")
-            self.progress.emit(40)
+            if not platform_list:
+                cursor.close()
+                connection.close()
+                self.error.emit("No platforms selected")
+                return
 
-            # 第四步：逐一检查每个组合是否已存在
-            total_combinations = len(shudi_list) * len(platform_list)
-            self.log_message.emit(
-                f"【预检查】共需检查 {len(shudi_list)} x {len(platform_list)} = {total_combinations} 个组合"
-            )
+            per_shopindex = len(shudi_list) * len(platform_list)
+            total_checks = len(shopindex_records) * per_shopindex
 
-            existing_count = 0
-            missing_count = 0
-            missing_details = []
-            existing_details = []
+            shopindex_ids = [r[0] for r in shopindex_records]
+            shudi_ids = [s[0] for s in shudi_list]
+            platform_ids = [p[0] for p in platform_list]
+            shudi_name_map = {s[0]: s[1] for s in shudi_list}
+            platform_name_map = {p[0]: p[1] for p in platform_list}
+
+            def chunked(seq, size):
+                for i in range(0, len(seq), size):
+                    yield seq[i:i + size]
+
+            existing_set = set()
+            batch_size = 500
+            id_chunks = list(chunked(shopindex_ids, batch_size))
+            total_chunk = max(len(id_chunks), 1)
+            self.log_message.emit(f"[PreCheck] Batch query existing rows in {total_chunk} chunks")
+
+            for idx, si_chunk in enumerate(id_chunks, 1):
+                si_ph = ",".join(["%s"] * len(si_chunk))
+                p_ph = ",".join(["%s"] * len(platform_ids))
+                sql = f"""
+                    SELECT shopindex_id, shudi_id, platform_id
+                    FROM ba_platform_info
+                    WHERE shopindex_id IN ({si_ph})
+                      AND platform_id IN ({p_ph})
+                      AND (delete_time IS NULL OR delete_time = 0)
+                """
+                cursor.execute(sql, tuple(si_chunk) + tuple(platform_ids))
+                for row in cursor.fetchall():
+                    existing_set.add((row[0], row[1], row[2]))
+
+                progress = 20 + int(idx / total_chunk * 30)
+                self.progress.emit(progress)
+
+            total_existing = 0
+            total_missing = 0
+            missing_by_shopindex = {}
             processed = 0
+            progress_step = max(total_checks // 200, 1)
 
-            for shudi in shudi_list:
-                shudi_id = shudi[0]
-                shudi_name = shudi[1]
+            for si_pk, si_id_val, si_admin_id, si_admin_dept_id in shopindex_records:
+                for shudi_id in shudi_ids:
+                    shudi_name = shudi_name_map.get(shudi_id, "")
+                    for platform_id in platform_ids:
+                        platform_name = platform_name_map.get(platform_id, "")
+                        processed += 1
+                        key = (si_pk, shudi_id, platform_id)
 
-                for platform in platform_list:
-                    platform_id = platform[0]
-                    platform_name = platform[1]
+                        if key in existing_set:
+                            total_existing += 1
+                        else:
+                            total_missing += 1
+                            if si_pk not in missing_by_shopindex:
+                                missing_by_shopindex[si_pk] = {
+                                    'shopindex_id_val': si_id_val,
+                                    'admin_id': si_admin_id,
+                                    'admin_dept_id': si_admin_dept_id,
+                                    'items': []
+                                }
+                            missing_by_shopindex[si_pk]['items'].append({
+                                'shudi_id': shudi_id,
+                                'shudi_name': shudi_name,
+                                'platform_id': platform_id,
+                                'platform_name': platform_name
+                            })
 
-                    processed += 1
-
-                    cursor.execute("""
-                        SELECT id FROM ba_platform_info 
-                        WHERE shopindex_id = %s AND shudi_id = %s AND platform_id = %s
-                        AND (delete_time IS NULL OR delete_time = 0)
-                    """, (shopindex_pk, shudi_id, platform_id))
-                    existing = cursor.fetchone()
-
-                    if existing:
-                        existing_count += 1
-                        self.log_message.emit(
-                            f"[{processed}/{total_combinations}] 已存在: "
-                            f"属地={shudi_name}, 平台={platform_name} (id={existing[0]})"
-                        )
-                        existing_details.append({
-                            'shudi_id': shudi_id,
-                            'shudi_name': shudi_name,
-                            'platform_id': platform_id,
-                            'platform_name': platform_name,
-                            'existing_id': existing[0]
-                        })
-                    else:
-                        missing_count += 1
-                        self.log_message.emit(
-                            f"[{processed}/{total_combinations}] 缺失: "
-                            f"属地={shudi_name}, 平台={platform_name}"
-                        )
-                        missing_details.append({
-                            'shudi_id': shudi_id,
-                            'shudi_name': shudi_name,
-                            'platform_id': platform_id,
-                            'platform_name': platform_name
-                        })
-
-                    progress = 40 + int(processed / total_combinations * 55)
-                    self.progress.emit(progress)
+                        if processed % progress_step == 0 or processed == total_checks:
+                            progress = 50 + int(processed / max(total_checks, 1) * 45)
+                            self.progress.emit(progress)
 
             cursor.close()
             connection.close()
 
-            self.log_message.emit("")
-            self.log_message.emit("========== 预检查结果 ==========")
-            self.log_message.emit(f"总组合数: {total_combinations}")
-            self.log_message.emit(f"已存在: {existing_count} 条")
-            self.log_message.emit(f"需补全: {missing_count} 条")
-            self.log_message.emit("================================")
-
             self.progress.emit(100)
             self.finished.emit({
-                'shopindex_pk': shopindex_pk,
-                'shopindex_id_val': shopindex_id_val,
-                'total_combinations': total_combinations,
-                'existing_count': existing_count,
-                'missing_count': missing_count,
-                'missing_details': missing_details,
-                'existing_details': existing_details,
-                'shudi_list': shudi_list,
-                'platform_list': platform_list
+                'shopindex_count': len(shopindex_records),
+                'total_checks': total_checks,
+                'total_existing': total_existing,
+                'total_missing': total_missing,
+                'missing_by_shopindex': missing_by_shopindex,
+                'scope_all': self.scope_all
             })
 
         except Exception as e:
@@ -231,28 +230,28 @@ class PreCheckWorker(QThread):
 
 
 class PlatformInfoFillWorker(QThread):
-    """补全单个主体编号平台详情工作线程 - 执行实际插入"""
+    """Fill missing ba_platform_info rows using batched SQL."""
     progress = pyqtSignal(int)
     log_message = pyqtSignal(str)
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
 
-    def __init__(self, datasource, db_manager, shopindex_pk, missing_details):
+    def __init__(self, datasource, db_manager, missing_by_shopindex):
         super().__init__()
         self.datasource = datasource
         self.db_manager = db_manager
-        self.shopindex_pk = shopindex_pk
-        self.missing_details = missing_details
+        self.missing_by_shopindex = missing_by_shopindex
+        self.total = sum(len(info['items']) for info in missing_by_shopindex.values())
         self.results = {
-            'total': len(missing_details),
+            'total': self.total,
             'inserted_count': 0,
             'failed_count': 0,
-            'details': []
+            'shopindex_count': len(missing_by_shopindex)
         }
 
     def run(self):
         try:
-            self.log_message.emit("【执行补全】开始连接数据库...")
+            self.log_message.emit("[Fill] Connecting to database...")
             self.progress.emit(5)
 
             connection = pymysql.connect(
@@ -264,57 +263,84 @@ class PlatformInfoFillWorker(QThread):
                 charset=self.datasource.charset
             )
             cursor = connection.cursor()
-            self.log_message.emit("【执行补全】数据库连接成功")
+            connection.autocommit(False)
+            self.log_message.emit("[Fill] Connected")
             self.progress.emit(10)
 
             current_time = int(time.time())
-            total = len(self.missing_details)
+            processed = 0
+            batch_size = 1000
 
-            for i, item in enumerate(self.missing_details):
-                shudi_id = item['shudi_id']
-                shudi_name = item['shudi_name']
-                platform_id = item['platform_id']
-                platform_name = item['platform_name']
+            def chunked(seq, size):
+                for i in range(0, len(seq), size):
+                    yield seq[i:i + size]
 
-                try:
-                    cursor.execute("""
-                        INSERT INTO ba_platform_info 
-                        (platform_id, shudi_id, shopindex_id, status, 
-                         create_time, update_time, admin_id, admin_dept_id)
-                        VALUES (%s, %s, %s, 1, %s, %s, 0, 0)
-                    """, (platform_id, shudi_id, self.shopindex_pk,
-                          current_time, current_time))
-                    connection.commit()
+            insert_sql = """
+                INSERT INTO ba_platform_info
+                (platform_id, shudi_id, shopindex_id, status,
+                 create_time, update_time, admin_id, admin_dept_id)
+                VALUES (%s, %s, %s, 1, %s, %s, %s, %s)
+            """
 
-                    self.results['inserted_count'] += 1
-                    self.log_message.emit(
-                        f"[{i+1}/{total}] 插入成功: "
-                        f"属地={shudi_name}, 平台={platform_name}"
-                    )
-                    self.results['details'].append({
-                        'shudi_id': shudi_id,
-                        'shudi_name': shudi_name,
-                        'platform_id': platform_id,
-                        'platform_name': platform_name,
-                        'status': '插入成功'
-                    })
-                except Exception as e:
-                    connection.rollback()
-                    self.results['failed_count'] += 1
-                    self.log_message.emit(
-                        f"[{i+1}/{total}] 插入失败: "
-                        f"属地={shudi_name}, 平台={platform_name}, 原因: {str(e)}"
-                    )
-                    self.results['details'].append({
-                        'shudi_id': shudi_id,
-                        'shudi_name': shudi_name,
-                        'platform_id': platform_id,
-                        'platform_name': platform_name,
-                        'status': f'插入失败: {str(e)}'
-                    })
+            for si_pk, info in self.missing_by_shopindex.items():
+                si_id_val = info['shopindex_id_val']
+                si_admin_id = info.get('admin_id') or 0
+                si_admin_dept_id = info.get('admin_dept_id') or 0
+                items = info['items']
+                if not items:
+                    continue
 
-                progress = 10 + int((i + 1) / total * 85)
-                self.progress.emit(progress)
+                shudi_ids = sorted({item['shudi_id'] for item in items})
+                platform_ids = sorted({item['platform_id'] for item in items})
+                existing_pairs = set()
+
+                s_ph = ",".join(["%s"] * len(shudi_ids))
+                p_ph = ",".join(["%s"] * len(platform_ids))
+                check_sql = f"""
+                    SELECT shudi_id, platform_id
+                    FROM ba_platform_info
+                    WHERE shopindex_id = %s
+                      AND shudi_id IN ({s_ph})
+                      AND platform_id IN ({p_ph})
+                      AND (delete_time IS NULL OR delete_time = 0)
+                """
+                cursor.execute(check_sql, (si_pk, *shudi_ids, *platform_ids))
+                for row in cursor.fetchall():
+                    existing_pairs.add((row[0], row[1]))
+
+                pending_rows = []
+                for item in items:
+                    pair = (item['shudi_id'], item['platform_id'])
+                    if pair not in existing_pairs:
+                        pending_rows.append((
+                            item['platform_id'], item['shudi_id'], si_pk,
+                            current_time, current_time, si_admin_id, si_admin_dept_id
+                        ))
+
+                self.log_message.emit(
+                    f"[Fill] shopindex={si_id_val}(id={si_pk}) pending {len(pending_rows)}/{len(items)}"
+                )
+
+                for batch in chunked(pending_rows, batch_size):
+                    try:
+                        cursor.executemany(insert_sql, batch)
+                        connection.commit()
+                        self.results['inserted_count'] += len(batch)
+                    except Exception as batch_error:
+                        connection.rollback()
+                        for row in batch:
+                            try:
+                                cursor.execute(insert_sql, row)
+                                connection.commit()
+                                self.results['inserted_count'] += 1
+                            except Exception:
+                                connection.rollback()
+                                self.results['failed_count'] += 1
+                        self.log_message.emit(f"[Fill] Batch fallback due to: {str(batch_error)}")
+
+                    processed += len(batch)
+                    progress = 10 + int(processed / max(self.total, 1) * 85)
+                    self.progress.emit(progress)
 
             cursor.close()
             connection.close()
@@ -327,13 +353,13 @@ class PlatformInfoFillWorker(QThread):
 
 
 class PlatformInfoFillWidget(QWidget):
-    """补全单个主体编号的平台详情功能组件"""
+    """补全主体编号的平台详情功能组件 - 支持全部/单个主体"""
 
     def __init__(self, db_manager: DatabaseManager):
         super().__init__()
         self.db_manager = db_manager
-        self.platform_checkboxes = []  # 存储 (checkbox, platform_data) 元组
-        self.all_platforms = []  # 从数据库加载的全部平台
+        self.platform_checkboxes = []
+        self.all_platforms = []
         self.precheck_data = None
         self.init_ui()
         self.load_datasources()
@@ -358,23 +384,39 @@ class PlatformInfoFillWidget(QWidget):
         datasource_group.setLayout(datasource_layout)
         layout.addWidget(datasource_group)
 
-        # 主体编号输入区域
-        input_group = QGroupBox("主体编号输入")
-        input_layout = QFormLayout()
+        # 范围选择区域
+        scope_group = QGroupBox("主体编号范围")
+        scope_layout = QVBoxLayout()
 
+        scope_radio_layout = QHBoxLayout()
+        self.scope_all_radio = QRadioButton("全部主体编号")
+        self.scope_single_radio = QRadioButton("指定主体编号")
+        self.scope_all_radio.setChecked(True)
+        self.scope_btn_group = QButtonGroup()
+        self.scope_btn_group.addButton(self.scope_all_radio)
+        self.scope_btn_group.addButton(self.scope_single_radio)
+        self.scope_all_radio.toggled.connect(self.on_scope_changed)
+        scope_radio_layout.addWidget(self.scope_all_radio)
+        scope_radio_layout.addWidget(self.scope_single_radio)
+        scope_radio_layout.addStretch()
+        scope_layout.addLayout(scope_radio_layout)
+
+        input_layout = QHBoxLayout()
+        input_layout.addWidget(QLabel("主体编号:"))
         self.shopindex_input = QLineEdit()
         self.shopindex_input.setPlaceholderText("请输入主体编号 (ba_shopindex.shopindex_id)")
+        self.shopindex_input.setEnabled(False)
         self.shopindex_input.textChanged.connect(self.on_input_changed)
-        input_layout.addRow("主体编号:", self.shopindex_input)
+        input_layout.addWidget(self.shopindex_input)
+        scope_layout.addLayout(input_layout)
 
-        input_group.setLayout(input_layout)
-        layout.addWidget(input_group)
+        scope_group.setLayout(scope_layout)
+        layout.addWidget(scope_group)
 
         # 平台选择区域
         platform_group = QGroupBox("平台选择 (请先加载平台列表)")
         platform_main_layout = QVBoxLayout()
 
-        # 加载平台 + 全选/取消全选 按钮行
         platform_btn_layout = QHBoxLayout()
 
         self.load_platform_btn = QPushButton("加载平台列表")
@@ -399,7 +441,6 @@ class PlatformInfoFillWidget(QWidget):
         platform_btn_layout.addStretch()
         platform_main_layout.addLayout(platform_btn_layout)
 
-        # 平台复选框滚动区域
         self.platform_scroll = QScrollArea()
         self.platform_scroll.setWidgetResizable(True)
         self.platform_scroll.setMaximumHeight(150)
@@ -417,13 +458,13 @@ class PlatformInfoFillWidget(QWidget):
         info_layout = QVBoxLayout()
 
         info_label = QLabel("""
-<b>补全单个主体编号的平台详情说明:</b><br>
+<b>补全主体编号的平台详情:</b><br>
 <b>操作步骤:</b><br>
-• 1. 选择数据库并输入主体编号<br>
+• 1. 选择数据库，选择范围（全部主体 或 指定主体编号）<br>
 • 2. 点击【加载平台列表】获取所有平台，勾选需要补全的平台<br>
 • 3. 点击【预检查】查看已有/缺失的记录数<br>
 • 4. 确认无误后点击【确认执行补全】插入缺失记录<br><br>
-<b>补全逻辑:</b> 选中的平台 × 所有属地 的组合，已存在则跳过
+<b>补全逻辑:</b> 主体编号 × 选中的平台 × 所有属地 的组合，插入前逐条检查已存在则跳过
         """)
         info_label.setWordWrap(True)
         info_layout.addWidget(info_label)
@@ -447,7 +488,6 @@ class PlatformInfoFillWidget(QWidget):
 
         button_layout.addStretch()
 
-        # 进度条
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         button_layout.addWidget(self.progress_bar)
@@ -499,8 +539,8 @@ class PlatformInfoFillWidget(QWidget):
         data = self.datasource_combo.currentData()
         self.test_btn.setEnabled(data is not None)
         self.load_platform_btn.setEnabled(data is not None)
-        # 数据源变化时清空平台列表
         self.clear_platform_checkboxes()
+        self.reset_precheck()
         self.update_button_states()
 
     def test_connection(self):
@@ -515,11 +555,24 @@ class PlatformInfoFillWidget(QWidget):
         else:
             QMessageBox.critical(self, "连接失败", message)
 
+    def on_scope_changed(self):
+        """范围切换"""
+        is_single = self.scope_single_radio.isChecked()
+        self.shopindex_input.setEnabled(is_single)
+        if not is_single:
+            self.shopindex_input.clear()
+        self.reset_precheck()
+        self.update_button_states()
+
     def on_input_changed(self):
         """输入变化时清除预检查结果"""
+        self.reset_precheck()
+        self.update_button_states()
+
+    def reset_precheck(self):
+        """清除预检查结果"""
         self.execute_btn.setEnabled(False)
         self.precheck_data = None
-        self.update_button_states()
 
     def clear_platform_checkboxes(self):
         """清空平台复选框列表"""
@@ -560,7 +613,7 @@ class PlatformInfoFillWidget(QWidget):
         for p in platform_list:
             p_id, p_name, p_financial, p_code = p
             cb = QCheckBox(f"[{p_id}] {p_name} (财务: {p_financial or '-'}, 编码: {p_code or '-'})")
-            cb.setChecked(True)  # 默认全选
+            cb.setChecked(True)
             cb.stateChanged.connect(self.on_platform_selection_changed)
             self.platform_scroll_layout.addWidget(cb)
             self.platform_checkboxes.append((cb, p))
@@ -590,9 +643,7 @@ class PlatformInfoFillWidget(QWidget):
     def on_platform_selection_changed(self):
         """平台选择变化时更新计数和按钮状态"""
         self.update_platform_count_label()
-        # 平台选择变化时清除预检查结果
-        self.execute_btn.setEnabled(False)
-        self.precheck_data = None
+        self.reset_precheck()
         self.update_button_states()
 
     def update_platform_count_label(self):
@@ -618,37 +669,54 @@ class PlatformInfoFillWidget(QWidget):
     def update_button_states(self):
         """更新按钮状态"""
         datasource_selected = self.datasource_combo.currentData() is not None
-        has_input = bool(self.shopindex_input.text().strip())
         has_platforms = len(self.get_selected_platforms()) > 0
-        self.precheck_btn.setEnabled(datasource_selected and has_input and has_platforms)
+
+        if self.scope_all_radio.isChecked():
+            # 全部模式：只需数据源和平台
+            self.precheck_btn.setEnabled(datasource_selected and has_platforms)
+        else:
+            # 单个模式：还需要输入主体编号
+            has_input = bool(self.shopindex_input.text().strip())
+            self.precheck_btn.setEnabled(datasource_selected and has_platforms and has_input)
 
     def start_precheck(self):
         """开始预检查"""
         datasource = self.datasource_combo.currentData()
-        shopindex_id_str = self.shopindex_input.text().strip()
         selected_platforms = self.get_selected_platforms()
 
-        if not datasource or not shopindex_id_str:
-            QMessageBox.warning(self, "警告", "请选择数据源并输入主体编号！")
+        if not datasource:
+            QMessageBox.warning(self, "警告", "请选择数据源！")
             return
 
         if not selected_platforms:
             QMessageBox.warning(self, "警告", "请至少选择一个平台！")
             return
 
-        # 禁用按钮，显示进度条
+        scope_all = self.scope_all_radio.isChecked()
+        shopindex_id_str = ''
+
+        if not scope_all:
+            shopindex_id_str = self.shopindex_input.text().strip()
+            if not shopindex_id_str:
+                QMessageBox.warning(self, "警告", "请输入主体编号！")
+                return
+
+        # 禁用控件
         self.precheck_btn.setEnabled(False)
         self.execute_btn.setEnabled(False)
         self.shopindex_input.setEnabled(False)
+        self.scope_all_radio.setEnabled(False)
+        self.scope_single_radio.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self.result_label.setText("正在预检查中...")
+        scope_desc = "全部主体" if scope_all else f"主体编号={shopindex_id_str}"
+        self.result_label.setText(f"正在预检查中... ({scope_desc})")
         self.log_text.clear()
         self.precheck_data = None
 
-        # 启动预检查线程
         self.precheck_worker = PreCheckWorker(
-            datasource, self.db_manager, shopindex_id_str, selected_platforms
+            datasource, self.db_manager, selected_platforms,
+            scope_all=scope_all, shopindex_id_str=shopindex_id_str
         )
         self.precheck_worker.progress.connect(self.progress_bar.setValue)
         self.precheck_worker.log_message.connect(self.append_log)
@@ -659,21 +727,29 @@ class PlatformInfoFillWidget(QWidget):
     def on_precheck_finished(self, results):
         """预检查完成"""
         self.precheck_btn.setEnabled(True)
-        self.shopindex_input.setEnabled(True)
+        self.shopindex_input.setEnabled(self.scope_single_radio.isChecked())
+        self.scope_all_radio.setEnabled(True)
+        self.scope_single_radio.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.precheck_data = results
 
-        total = results['total_combinations']
-        existing = results['existing_count']
-        missing = results['missing_count']
+        si_count = results['shopindex_count']
+        total_checks = results['total_checks']
+        existing = results['total_existing']
+        missing = results['total_missing']
+        missing_si = len(results['missing_by_shopindex'])
 
+        scope_desc = "全部主体" if results['scope_all'] else "指定主体"
         result_text = (
-            f"预检查完成！\n"
-            f"主体编号: {results['shopindex_id_val']} (id={results['shopindex_pk']})\n"
-            f"总组合数: {total} (选中平台数 × 属地数)\n"
+            f"预检查完成！ ({scope_desc})\n"
+            f"主体编号数: {si_count}\n"
+            f"总检查组合: {total_checks}\n"
             f"已存在: {existing} 条\n"
             f"需补全: {missing} 条"
         )
+        if missing > 0:
+            result_text += f"\n涉及 {missing_si} 个主体"
+
         self.result_label.setText(result_text)
 
         if missing > 0:
@@ -688,13 +764,15 @@ class PlatformInfoFillWidget(QWidget):
             self.execute_btn.setEnabled(False)
             QMessageBox.information(
                 self, "预检查完成",
-                f"{result_text}\n\n选中平台的所有组合均已存在，无需补全。"
+                f"{result_text}\n\n所有组合均已存在，无需补全。"
             )
 
     def on_precheck_error(self, error_msg):
         """预检查错误"""
         self.precheck_btn.setEnabled(True)
-        self.shopindex_input.setEnabled(True)
+        self.shopindex_input.setEnabled(self.scope_single_radio.isChecked())
+        self.scope_all_radio.setEnabled(True)
+        self.scope_single_radio.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.result_label.setText("预检查失败！")
         self.result_label.setStyleSheet("color: red;")
@@ -702,7 +780,7 @@ class PlatformInfoFillWidget(QWidget):
 
     def start_fill(self):
         """开始执行补全"""
-        if not self.precheck_data or not self.precheck_data['missing_details']:
+        if not self.precheck_data or not self.precheck_data['missing_by_shopindex']:
             QMessageBox.warning(self, "警告", "请先执行预检查！")
             return
 
@@ -711,17 +789,19 @@ class PlatformInfoFillWidget(QWidget):
             QMessageBox.warning(self, "警告", "请选择数据源！")
             return
 
-        missing = self.precheck_data['missing_count']
-        shopindex_id_val = self.precheck_data['shopindex_id_val']
+        missing = self.precheck_data['total_missing']
+        missing_si = len(self.precheck_data['missing_by_shopindex'])
+        scope_desc = "全部主体" if self.precheck_data['scope_all'] else "指定主体"
 
-        # 确认对话框
         reply = QMessageBox.question(
             self,
             "确认执行补全",
-            f"确定要为主体编号 [{shopindex_id_val}] 补全平台详情吗？\n\n"
+            f"确定要执行补全吗？ ({scope_desc})\n\n"
             f"数据库: {datasource.name}\n"
+            f"涉及主体: {missing_si} 个\n"
             f"待补全: {missing} 条\n\n"
-            f"此操作将向 ba_platform_info 表插入 {missing} 条新记录。",
+            f"此操作将向 ba_platform_info 表插入最多 {missing} 条新记录。\n"
+            f"每条插入前会再次检查是否已存在，确保不重复。",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
@@ -729,19 +809,19 @@ class PlatformInfoFillWidget(QWidget):
         if reply != QMessageBox.Yes:
             return
 
-        # 禁用按钮，显示进度条
+        # 禁用控件
         self.precheck_btn.setEnabled(False)
         self.execute_btn.setEnabled(False)
         self.shopindex_input.setEnabled(False)
+        self.scope_all_radio.setEnabled(False)
+        self.scope_single_radio.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.result_label.setText("正在执行补全...")
 
-        # 启动补全线程
         self.worker = PlatformInfoFillWorker(
             datasource, self.db_manager,
-            self.precheck_data['shopindex_pk'],
-            self.precheck_data['missing_details']
+            self.precheck_data['missing_by_shopindex']
         )
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log_message.connect(self.append_log)
@@ -757,13 +837,16 @@ class PlatformInfoFillWidget(QWidget):
     def on_fill_finished(self, results):
         """补全完成"""
         self.precheck_btn.setEnabled(True)
-        self.shopindex_input.setEnabled(True)
+        self.shopindex_input.setEnabled(self.scope_single_radio.isChecked())
+        self.scope_all_radio.setEnabled(True)
+        self.scope_single_radio.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.execute_btn.setEnabled(False)
         self.precheck_data = None
 
         result_text = (
             f"补全完成！\n"
+            f"涉及主体: {results['shopindex_count']} 个\n"
             f"待补全：{results['total']} 条\n"
             f"成功插入：{results['inserted_count']} 条\n"
             f"失败：{results['failed_count']} 条"
@@ -780,7 +863,9 @@ class PlatformInfoFillWidget(QWidget):
     def on_fill_error(self, error_msg):
         """补全错误"""
         self.precheck_btn.setEnabled(True)
-        self.shopindex_input.setEnabled(True)
+        self.shopindex_input.setEnabled(self.scope_single_radio.isChecked())
+        self.scope_all_radio.setEnabled(True)
+        self.scope_single_radio.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.execute_btn.setEnabled(False)
         self.result_label.setText("补全失败！")
