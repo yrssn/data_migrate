@@ -33,6 +33,8 @@ from .customer_status_fix_widget import CustomerStatusFixWidget
 from .inventory_status_update_widget import InventoryStatusUpdateWidget
 from .excel_json_format_widget import ExcelJsonFormatWidget
 from .platform_info_fill_widget import PlatformInfoFillWidget
+from .legal_change_fix_widget import LegalChangeFixWidget
+from .status_change_widget import StatusChangeWidget
 
 
 class MainWindow(QMainWindow):
@@ -65,6 +67,10 @@ class MainWindow(QMainWindow):
         # 迁移任务标签页（占位）
         migration_tab = self.create_migration_tab()
         self.tab_widget.addTab(migration_tab, "迁移任务")
+        
+        # 迁移任务2标签页
+        migration_tab2 = self.create_migration_tab2()
+        self.tab_widget.addTab(migration_tab2, "迁移任务2")
         
         main_layout.addWidget(self.tab_widget)
         
@@ -182,6 +188,7 @@ class MainWindow(QMainWindow):
         self.function_combo.addItem("按库存主键更新状态", "inventory_status_update")
         self.function_combo.addItem("Excel JSON格式转换", "excel_json_format")
         self.function_combo.addItem("补全单个主体编号的平台详情", "platform_info_fill")
+        self.function_combo.addItem("修复变更法人", "legal_change_fix")
         # self.function_combo.addItem("数据库表迁移（待开发）", "db_migrate")
         # self.function_combo.addItem("数据格式转换（待开发）", "format_convert")
         self.function_combo.currentTextChanged.connect(self.on_function_changed)
@@ -286,6 +293,10 @@ class MainWindow(QMainWindow):
         self.platform_info_fill_widget = PlatformInfoFillWidget(self.db_manager)
         self.function_stack.addWidget(self.platform_info_fill_widget)
         
+        # 修复变更法人功能
+        self.legal_change_fix_widget = LegalChangeFixWidget(self.db_manager)
+        self.function_stack.addWidget(self.legal_change_fix_widget)
+        
         # 占位页面（其他功能）
         placeholder_widget = QWidget()
         placeholder_layout = QVBoxLayout()
@@ -349,8 +360,60 @@ class MainWindow(QMainWindow):
             self.function_stack.setCurrentIndex(21)
         elif "补全单个主体编号的平台详情" in text:
             self.function_stack.setCurrentIndex(22)
-        else:
+        elif "修复变更法人" in text:
             self.function_stack.setCurrentIndex(23)
+        else:
+            self.function_stack.setCurrentIndex(24)
+    
+    def create_migration_tab2(self) -> QWidget:
+        """创建迁移任务2标签页"""
+        widget = QWidget()
+        layout = QVBoxLayout()
+        
+        # 功能选择区域
+        function_group = QGroupBox("选择迁移功能")
+        function_layout = QHBoxLayout()
+        
+        function_label = QLabel("功能类型:")
+        function_layout.addWidget(function_label)
+        
+        self.function_combo2 = QComboBox()
+        self.function_combo2.addItem("改变状态栏", "status_change")
+        self.function_combo2.currentTextChanged.connect(self.on_function_changed2)
+        function_layout.addWidget(self.function_combo2)
+        
+        function_layout.addStretch()
+        function_group.setLayout(function_layout)
+        layout.addWidget(function_group)
+        
+        # 功能内容区域（使用堆叠窗口）
+        self.function_stack2 = QStackedWidget()
+        
+        # 改变状态栏功能
+        self.status_change_widget = StatusChangeWidget(self.db_manager)
+        self.function_stack2.addWidget(self.status_change_widget)
+        
+        # 占位页面（其他功能）
+        placeholder_widget = QWidget()
+        placeholder_layout = QVBoxLayout()
+        placeholder_label = QLabel("该功能正在开发中...")
+        placeholder_label.setAlignment(Qt.AlignCenter)
+        placeholder_label.setStyleSheet("font-size: 16px; color: gray;")
+        placeholder_layout.addWidget(placeholder_label)
+        placeholder_widget.setLayout(placeholder_layout)
+        self.function_stack2.addWidget(placeholder_widget)
+        
+        layout.addWidget(self.function_stack2)
+        
+        widget.setLayout(layout)
+        return widget
+    
+    def on_function_changed2(self, text):
+        """迁移任务2功能选择变化"""
+        if "改变状态栏" in text:
+            self.function_stack2.setCurrentIndex(0)
+        else:
+            self.function_stack2.setCurrentIndex(1)
     
     def load_datasources(self):
         """加载数据源列表"""
