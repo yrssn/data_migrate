@@ -35,6 +35,8 @@ from .excel_json_format_widget import ExcelJsonFormatWidget
 from .platform_info_fill_widget import PlatformInfoFillWidget
 from .legal_change_fix_widget import LegalChangeFixWidget
 from .status_change_widget import StatusChangeWidget
+from .platform_info_preprocess_widget import PlatformInfoPreprocessWidget
+from .extract_by_column_widget import ExtractByColumnWidget
 
 
 class MainWindow(QMainWindow):
@@ -369,30 +371,40 @@ class MainWindow(QMainWindow):
         """创建迁移任务2标签页"""
         widget = QWidget()
         layout = QVBoxLayout()
-        
+
         # 功能选择区域
         function_group = QGroupBox("选择迁移功能")
         function_layout = QHBoxLayout()
-        
+
         function_label = QLabel("功能类型:")
         function_layout.addWidget(function_label)
-        
+
         self.function_combo2 = QComboBox()
         self.function_combo2.addItem("改变状态栏", "status_change")
+        self.function_combo2.addItem("平台注册部平台详情预先处理", "platform_info_preprocess")
+        self.function_combo2.addItem("去除平台重复数据", "extract_by_column")
         self.function_combo2.currentTextChanged.connect(self.on_function_changed2)
         function_layout.addWidget(self.function_combo2)
-        
+
         function_layout.addStretch()
         function_group.setLayout(function_layout)
         layout.addWidget(function_group)
-        
+
         # 功能内容区域（使用堆叠窗口）
         self.function_stack2 = QStackedWidget()
-        
+
         # 改变状态栏功能
         self.status_change_widget = StatusChangeWidget(self.db_manager)
         self.function_stack2.addWidget(self.status_change_widget)
-        
+
+        # 平台注册部平台详情预先处理功能
+        self.platform_info_preprocess_widget = PlatformInfoPreprocessWidget(self.db_manager)
+        self.function_stack2.addWidget(self.platform_info_preprocess_widget)
+
+        # 去除平台重复数据功能
+        self.extract_by_column_widget = ExtractByColumnWidget(self.db_manager)
+        self.function_stack2.addWidget(self.extract_by_column_widget)
+
         # 占位页面（其他功能）
         placeholder_widget = QWidget()
         placeholder_layout = QVBoxLayout()
@@ -402,18 +414,22 @@ class MainWindow(QMainWindow):
         placeholder_layout.addWidget(placeholder_label)
         placeholder_widget.setLayout(placeholder_layout)
         self.function_stack2.addWidget(placeholder_widget)
-        
+
         layout.addWidget(self.function_stack2)
-        
+
         widget.setLayout(layout)
         return widget
-    
+
     def on_function_changed2(self, text):
         """迁移任务2功能选择变化"""
         if "改变状态栏" in text:
             self.function_stack2.setCurrentIndex(0)
-        else:
+        elif "平台注册部平台详情预先处理" in text:
             self.function_stack2.setCurrentIndex(1)
+        elif "去除平台重复数据" in text:
+            self.function_stack2.setCurrentIndex(2)
+        else:
+            self.function_stack2.setCurrentIndex(3)
     
     def load_datasources(self):
         """加载数据源列表"""

@@ -87,16 +87,17 @@ class ExcelDedupWorker(QThread):
             self.progress.emit(30)
             
             # 根据选择的列进行去重，并识别重复数据
+            # 使用keep='last'保留最后一条（最新的）
             if self.selected_columns:
-                # 标记重复行
-                df['is_duplicate'] = df.duplicated(subset=self.selected_columns, keep='first')
-                # 获取去重后的数据（保留第一次出现的）
+                # 标记重复行（keep='last'表示保留最后一条，前面的标记为重复）
+                df['is_duplicate'] = df.duplicated(subset=self.selected_columns, keep='last')
+                # 获取去重后的数据（保留最后一次出现的）
                 df_dedup = df[~df['is_duplicate']].drop('is_duplicate', axis=1)
-                # 获取重复的数据（除了第一次出现的）
+                # 获取重复的数据（除了最后一次出现的都是重复）
                 df_duplicates = df[df['is_duplicate']].drop('is_duplicate', axis=1)
             else:
                 # 对所有列去重
-                df['is_duplicate'] = df.duplicated(keep='first')
+                df['is_duplicate'] = df.duplicated(keep='last')
                 df_dedup = df[~df['is_duplicate']].drop('is_duplicate', axis=1)
                 df_duplicates = df[df['is_duplicate']].drop('is_duplicate', axis=1)
             
@@ -115,9 +116,9 @@ class ExcelDedupWorker(QThread):
                 
                 # 添加重复原因列
                 if self.selected_columns:
-                    duplicate_reason = f"基于列 [{', '.join(self.selected_columns)}] 的重复数据"
+                    duplicate_reason = f"基于列 [{', '.join(self.selected_columns)}] 的重复数据（保留了最后一条）"
                 else:
-                    duplicate_reason = "基于所有列的重复数据"
+                    duplicate_reason = "基于所有列的重复数据（保留了最后一条）"
                 
                 df_duplicates_with_info.insert(0, '重复原因', duplicate_reason)
                 df_duplicates_with_info.insert(1, '原始行号', df_duplicates.index + 2)  # +2因为Excel从1开始且有表头
@@ -197,7 +198,7 @@ class ExcelDedupWidget(QWidget):
         layout.addWidget(file_group)
         
         # 列选择区域
-        self.column_group = QGroupBox("选择去重依据列（不选择则对所有列去重）")
+        self.column_group = QGroupBox("选择去重依据列（不选择则对所有列去重，保留最后一条/最新的）")
         self.column_group.setEnabled(False)
         
         # 使用滚动区域来容纳可能很多的列
