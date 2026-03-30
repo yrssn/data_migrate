@@ -19,23 +19,26 @@ class LegalInfoImportWorker(QThread):
     """法人信息导入工作线程"""
     progress = pyqtSignal(int)
     log_message = pyqtSignal(str)
-    finished = pyqtSignal(dict)  # 返回统计结果
+    finished = pyqtSignal(dict)
     error = pyqtSignal(str)
     
-    def __init__(self, input_file, datasource, db_manager):
+    def __init__(self, input_file, datasource, db_manager, column_mapping, filter_corporate):
         super().__init__()
         self.input_file = input_file
         self.datasource = datasource
         self.db_manager = db_manager
+        self.column_mapping = column_mapping
+        self.filter_corporate = filter_corporate
         self.results = {
             'total': 0,
             'success_jp': 0,
             'success_non_jp': 0,
             'skipped_not_corporate': 0,
             'skipped_customer_not_found': 0,
-            'skipped_duplicate': 0,  # 新增：跳过重复记录
+            'skipped_duplicate': 0,
+            'skipped_empty': 0,
             'failed': 0,
-            'error_records': []  # 存储错误记录用于导出
+            'error_records': []
         }
     
     def run(self):
@@ -43,7 +46,6 @@ class LegalInfoImportWorker(QThread):
             self.log_message.emit("开始读取Excel文件...")
             self.progress.emit(5)
             
-            # 读取Excel文件
             if self.input_file.endswith('.xlsx'):
                 try:
                     df = pd.read_excel(self.input_file, engine='openpyxl', header=0)
@@ -66,7 +68,6 @@ class LegalInfoImportWorker(QThread):
             self.log_message.emit(f"读取到 {len(df)} 行数据")
             self.progress.emit(10)
             
-            # 连接数据库
             self.log_message.emit("连接数据库...")
             connection = pymysql.connect(
                 host=self.datasource.host,
@@ -80,36 +81,38 @@ class LegalInfoImportWorker(QThread):
             cursor = connection.cursor()
             self.progress.emit(15)
             
-            # 处理每一行数据
             for index, row in df.iterrows():
                 try:
                     progress = 15 + int((index / len(df)) * 80)
                     self.progress.emit(progress)
                     
-                    # 检查列数是否足够
-                    if len(df.columns) < 8:
-                        error_msg = f"第{index+2}行: Excel列数不足，需要至少8列"
+                    # 获取客户类型（如果配置了筛选）
+                    if self.filter_corporate:
+                        customer_type_col = self.column_mapping.get('customer_type')
+                        if customer_type_col is not None and customer_type_col >= 0:
+                            customer_type_value = self.get_cell_value(row, customer_type_col)
+                            if customer_type_value != "企业法人":
+                                error_msg = f"第{index+2}行: 客户类型不是'企业法人'，跳过 (值: '{customer_type_value}')"
+                                self.log_message.emit(error_msg)
+                                self.add_error_record(df, index, error_msg)
+                                self.results['skipped_not_corporate'] += 1
+                                continue
+                    
+                    # 获取法人姓名
+                    legal_name_col = self.column_mapping.get('legal_name')
+                    if legal_name_col is None or legal_name_col < 0:
+                        error_msg = f"第{index+2}行: 未配置法人姓名列"
                         self.log_message.emit(error_msg)
                         self.add_error_record(df, index, error_msg)
                         self.results['failed'] += 1
                         continue
                     
-                    # 获取G列数据（客户类型）
-                    g_value = str(row.iloc[6]).strip() if pd.notna(row.iloc[6]) else ""
-                    if g_value != "企业法人":
-                        error_msg = f"第{index+2}行: G列不是'企业法人'，跳过 (值: '{g_value}')"
-                        self.log_message.emit(error_msg)
-                        self.add_error_record(df, index, error_msg)
-                        self.results['skipped_not_corporate'] += 1
-                        continue
-                    
-                    # 获取B列数据（法人姓名）
-                    legal_name = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ""
+                    legal_name = self.get_cell_value(row, legal_name_col)
                     if not legal_name:
-                        error_msg = f"第{index+2}行: B列法人姓名为空"
+                        error_msg = f"第{index+2}行: 法人姓名为空"
                         self.log_message.emit(error_msg)
                         self.add_error_record(df, index, error_msg)
-                        self.results['failed'] += 1
+                        self.results['skipped_empty'] += 1
                         continue
                     
                     # 在ba_rlb_customer表中查找对应的客户
@@ -130,31 +133,41 @@ class LegalInfoImportWorker(QThread):
                     customer_id, admin_id, rlb_staff_id, admin_dept_id = customer_result
                     self.log_message.emit(f"第{index+2}行: 找到客户 '{legal_name}' (ID: {customer_id})")
                     
-                    # 获取F列数据（国家）
-                    country = str(row.iloc[5]).strip() if pd.notna(row.iloc[5]) else ""
+                    # 获取国家
+                    country_col = self.column_mapping.get('country')
+                    country = ""
+                    if country_col is not None and country_col >= 0:
+                        country = self.get_cell_value(row, country_col) or ""
                     
-                    # 获取E列数据（公司名）
-                    company_name = str(row.iloc[4]).strip() if pd.notna(row.iloc[4]) else ""
+                    # 获取公司名
+                    company_name_col = self.column_mapping.get('company_name')
+                    company_name = ""
+                    if company_name_col is not None and company_name_col >= 0:
+                        company_name = self.get_cell_value(row, company_name_col) or ""
                     
                     current_time = int(datetime.now().timestamp())
                     
-                    # 根据F列值（国家）决定插入到哪个表
-                    if country.upper() == "日本" or country.upper() == "JAPAN" or country.upper() == "JP":
-                        # 检查ba_rlb_legal_information表中是否已存在相同记录
+                    # 根据国家决定去哪个表查和插入
+                    is_japan = country.upper() in ["日本", "JAPAN", "JP"]
+                    
+                    if is_japan:
+                        # 先根据公司名和法人姓名检查ba_rlb_legal_information表中是否已存在
+                        # 通过legal_id关联ba_rlb_customer表的legal_name来匹配法人姓名
                         cursor.execute("""
-                            SELECT id FROM ba_rlb_legal_information 
-                            WHERE company_name = %s AND country = %s AND legal_id = %s
-                        """, (company_name, country, customer_id))
+                            SELECT li.id FROM ba_rlb_legal_information li
+                            INNER JOIN ba_rlb_customer c ON li.legal_id = c.id
+                            WHERE li.company_name = %s AND c.legal_name = %s
+                              AND (li.delete_time IS NULL OR li.delete_time = 0)
+                        """, (company_name, legal_name))
                         existing_record = cursor.fetchone()
                         
                         if existing_record:
-                            error_msg = f"第{index+2}行: ba_rlb_legal_information表中已存在相同记录 - 公司: '{company_name}', 国家: '{country}', 法人ID: {customer_id}"
+                            error_msg = f"第{index+2}行: ba_rlb_legal_information表中已存在 - 公司: '{company_name}', 法人: '{legal_name}' (ID: {existing_record[0]})"
                             self.log_message.emit(error_msg)
                             self.add_error_record(df, index, error_msg)
                             self.results['skipped_duplicate'] += 1
                             continue
                         
-                        # 插入到ba_rlb_legal_information表
                         insert_sql = """
                             INSERT INTO ba_rlb_legal_information 
                             (company_name, country, legal_id, admin_id, create_staff, rlb_staff_id, create_time, update_time)
@@ -166,31 +179,32 @@ class LegalInfoImportWorker(QThread):
                             country,
                             customer_id,
                             admin_id,
-                            "系统导入",  # create_staff使用固定值"系统导入"
+                            "系统导入",
                             rlb_staff_id,
                             current_time,
                             current_time
                         ))
                         
                         self.results['success_jp'] += 1
-                        self.log_message.emit(f"第{index+2}行: 成功插入到ba_rlb_legal_information表 - 公司: '{company_name}', 国家: '{country}'")
+                        self.log_message.emit(f"第{index+2}行: 成功插入到ba_rlb_legal_information表 - 公司: '{company_name}', 法人: '{legal_name}', 国家: '{country}'")
                         
                     else:
-                        # 检查ba_rlb_legal_information_part2表中是否已存在相同记录
+                        # 先根据公司名和法人姓名检查ba_rlb_legal_information_part2表中是否已存在
                         cursor.execute("""
-                            SELECT id FROM ba_rlb_legal_information_part2 
-                            WHERE company_name = %s AND country = %s AND legal_id = %s
-                        """, (company_name, country, customer_id))
+                            SELECT li.id FROM ba_rlb_legal_information_part2 li
+                            INNER JOIN ba_rlb_customer c ON li.legal_id = c.id
+                            WHERE li.company_name = %s AND c.legal_name = %s
+                              AND (li.delete_time IS NULL OR li.delete_time = 0)
+                        """, (company_name, legal_name))
                         existing_record = cursor.fetchone()
                         
                         if existing_record:
-                            error_msg = f"第{index+2}行: ba_rlb_legal_information_part2表中已存在相同记录 - 公司: '{company_name}', 国家: '{country}', 法人ID: {customer_id}"
+                            error_msg = f"第{index+2}行: ba_rlb_legal_information_part2表中已存在 - 公司: '{company_name}', 法人: '{legal_name}' (ID: {existing_record[0]})"
                             self.log_message.emit(error_msg)
                             self.add_error_record(df, index, error_msg)
                             self.results['skipped_duplicate'] += 1
                             continue
                         
-                        # 插入到ba_rlb_legal_information_part2表
                         insert_sql = """
                             INSERT INTO ba_rlb_legal_information_part2 
                             (company_name, country, legal_id, admin_id, create_staff, rlb_staff_id, create_time, update_time)
@@ -202,14 +216,14 @@ class LegalInfoImportWorker(QThread):
                             country,
                             customer_id,
                             admin_id,
-                            "系统导入",  # create_staff使用固定值"系统导入"
+                            "系统导入",
                             rlb_staff_id,
                             current_time,
                             current_time
                         ))
                         
                         self.results['success_non_jp'] += 1
-                        self.log_message.emit(f"第{index+2}行: 成功插入到ba_rlb_legal_information_part2表 - 公司: '{company_name}', 国家: '{country}'")
+                        self.log_message.emit(f"第{index+2}行: 成功插入到ba_rlb_legal_information_part2表 - 公司: '{company_name}', 法人: '{legal_name}', 国家: '{country}'")
                     
                 except Exception as e:
                     self.results['failed'] += 1
@@ -217,7 +231,6 @@ class LegalInfoImportWorker(QThread):
                     self.log_message.emit(error_msg)
                     self.add_error_record(df, index, error_msg)
             
-            # 提交事务
             connection.commit()
             cursor.close()
             connection.close()
@@ -227,6 +240,15 @@ class LegalInfoImportWorker(QThread):
             
         except Exception as e:
             self.error.emit(str(e))
+    
+    def get_cell_value(self, row, col_index):
+        """获取单元格值"""
+        if col_index is None or col_index < 0 or col_index >= len(row):
+            return None
+        value = row.iloc[col_index]
+        if pd.isna(value) or str(value).strip() == '' or str(value).strip().lower() == 'nan':
+            return None
+        return str(value).strip()
     
     def add_error_record(self, df, index, error_msg):
         """添加错误记录"""
@@ -285,37 +307,67 @@ class LegalInfoImportWidget(QWidget):
         file_group.setLayout(file_layout)
         layout.addWidget(file_group)
         
+        # 列映射配置区域
+        mapping_group = QGroupBox("列映射配置（选择Excel文件后可配置）")
+        mapping_layout = QFormLayout()
+        
+        # 法人姓名列（必选）
+        self.legal_name_col_combo = QComboBox()
+        self.legal_name_col_combo.setEnabled(False)
+        self.legal_name_col_combo.currentIndexChanged.connect(self.update_import_button_state)
+        mapping_layout.addRow("法人姓名列 (必选，用于匹配ba_rlb_customer):", self.legal_name_col_combo)
+        
+        # 公司名列
+        self.company_name_col_combo = QComboBox()
+        self.company_name_col_combo.setEnabled(False)
+        mapping_layout.addRow("公司名列 (对应company_name):", self.company_name_col_combo)
+        
+        # 国家列
+        self.country_col_combo = QComboBox()
+        self.country_col_combo.setEnabled(False)
+        mapping_layout.addRow("国家列 (日本→JP表，其他→Part2表):", self.country_col_combo)
+        
+        # 客户类型列（可选，用于筛选）
+        self.customer_type_col_combo = QComboBox()
+        self.customer_type_col_combo.setEnabled(False)
+        mapping_layout.addRow("客户类型列 (可选，用于筛选企业法人):", self.customer_type_col_combo)
+        
+        # 是否只导入企业法人
+        self.filter_corporate_checkbox = QCheckBox("只导入客户类型为'企业法人'的记录")
+        self.filter_corporate_checkbox.setChecked(True)
+        mapping_layout.addRow("", self.filter_corporate_checkbox)
+        
+        mapping_group.setLayout(mapping_layout)
+        layout.addWidget(mapping_group)
+        
         # 数据预览区域
-        self.preview_group = QGroupBox("数据预览和处理逻辑说明")
-        self.preview_group.setEnabled(False)
+        preview_group = QGroupBox("数据预览（前5行）")
         preview_layout = QVBoxLayout()
         
-        # 说明文字
-        info_label = QLabel("""
-<b>处理逻辑说明:</b><br>
-• <b>G列</b>: 必须是"企业法人"，否则跳过<br>
-• <b>B列</b>: 法人姓名 → 在ba_rlb_customer表中查找对应ID<br>
-• <b>F列</b>: 国家判断<br>
-  &nbsp;&nbsp;- 如果是"日本"、"JAPAN"或"JP" → 插入ba_rlb_legal_information表<br>
-  &nbsp;&nbsp;- 如果不是日本 → 插入ba_rlb_legal_information_part2表<br>
-• <b>F列</b>: 国家 → country字段<br>
-• <b>E列</b>: 公司名 → company_name字段<br><br>
-<b>字段映射:</b><br>
-• legal_id ← ba_rlb_customer.id<br>
-• admin_id ← ba_rlb_customer.admin_id<br>
-• rlb_staff_id ← ba_rlb_customer.rlb_staff_id<br>
-• create_staff ← 固定值"系统导入"<br>
-• create_time, update_time ← 当前时间戳
-        """)
-        info_label.setWordWrap(True)
-        preview_layout.addWidget(info_label)
-        
         self.preview_table = QTableWidget()
-        self.preview_table.setMaximumHeight(200)
+        self.preview_table.setMaximumHeight(150)
         preview_layout.addWidget(self.preview_table)
         
-        self.preview_group.setLayout(preview_layout)
-        layout.addWidget(self.preview_group)
+        preview_group.setLayout(preview_layout)
+        layout.addWidget(preview_group)
+        
+        # 功能说明区域
+        info_group = QGroupBox("功能说明")
+        info_layout = QVBoxLayout()
+        
+        info_label = QLabel("""
+<b>Excel导入法人信息说明:</b><br>
+• 法人姓名: 必选，用于在ba_rlb_customer表中查找客户ID<br>
+• 公司名: 对应company_name字段<br>
+• 国家: 如果是"日本/JAPAN/JP"→插入ba_rlb_legal_information表，否则→插入ba_rlb_legal_information_part2表<br>
+• 客户类型: 可选，勾选筛选后只导入"企业法人"<br>
+• 自动填充: legal_id, admin_id, rlb_staff_id从ba_rlb_customer获取, create_staff="系统导入"
+        """)
+        info_label.setWordWrap(True)
+        info_layout.addWidget(info_label)
+        
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
         
         # 操作按钮区域
         button_layout = QHBoxLayout()
@@ -327,7 +379,6 @@ class LegalInfoImportWidget(QWidget):
         
         button_layout.addStretch()
         
-        # 进度条
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         button_layout.addWidget(self.progress_bar)
@@ -339,7 +390,7 @@ class LegalInfoImportWidget(QWidget):
         log_layout = QVBoxLayout()
         
         self.log_text = QTextEdit()
-        self.log_text.setMaximumHeight(200)
+        self.log_text.setMaximumHeight(150)
         self.log_text.setReadOnly(True)
         log_layout.addWidget(self.log_text)
         
@@ -419,7 +470,6 @@ class LegalInfoImportWidget(QWidget):
     def load_excel_preview(self):
         """加载Excel文件预览"""
         try:
-            # 读取Excel文件
             if self.input_file.endswith('.xlsx'):
                 try:
                     self.df = pd.read_excel(self.input_file, engine='openpyxl', header=0)
@@ -438,14 +488,71 @@ class LegalInfoImportWidget(QWidget):
             else:
                 self.df = pd.read_excel(self.input_file, engine='xlrd', header=0)
             
-            # 启用预览组件
-            self.preview_group.setEnabled(True)
+            # 填充列选择下拉框
+            self.populate_column_combos()
             
-            # 显示数据预览（前5行）
+            # 显示数据预览
             self.show_data_preview()
             
         except Exception as e:
             QMessageBox.critical(self, "错误", f"读取Excel文件失败：{str(e)}")
+    
+    def populate_column_combos(self):
+        """填充列选择下拉框"""
+        if self.df is None:
+            return
+        
+        columns = self.df.columns.tolist()
+        
+        col_options = []
+        for i, col in enumerate(columns):
+            col_letter = chr(65 + i) if i < 26 else f"A{chr(65 + i - 26)}" if i < 52 else f"Col{i+1}"
+            col_options.append((f"{col_letter}列: {col}", i))
+        
+        # 法人姓名列（必选）
+        self.legal_name_col_combo.clear()
+        self.legal_name_col_combo.addItem("请选择列", -1)
+        for text, idx in col_options:
+            self.legal_name_col_combo.addItem(text, idx)
+        self.legal_name_col_combo.setEnabled(True)
+        
+        # 公司名列
+        self.company_name_col_combo.clear()
+        self.company_name_col_combo.addItem("请选择列", -1)
+        for text, idx in col_options:
+            self.company_name_col_combo.addItem(text, idx)
+        self.company_name_col_combo.setEnabled(True)
+        
+        # 国家列
+        self.country_col_combo.clear()
+        self.country_col_combo.addItem("请选择列", -1)
+        for text, idx in col_options:
+            self.country_col_combo.addItem(text, idx)
+        self.country_col_combo.setEnabled(True)
+        
+        # 客户类型列（可选）
+        self.customer_type_col_combo.clear()
+        self.customer_type_col_combo.addItem("不使用", -1)
+        for text, idx in col_options:
+            self.customer_type_col_combo.addItem(text, idx)
+        self.customer_type_col_combo.setEnabled(True)
+        
+        # 尝试自动匹配
+        self.auto_match_columns(columns)
+    
+    def auto_match_columns(self, columns):
+        """尝试自动匹配常见列名"""
+        for i, col in enumerate(columns):
+            col_lower = str(col).lower()
+            
+            if '法人' in col_lower and ('姓名' in col_lower or '名' in col_lower):
+                self.legal_name_col_combo.setCurrentIndex(i + 1)
+            elif '公司' in col_lower and '名' in col_lower:
+                self.company_name_col_combo.setCurrentIndex(i + 1)
+            elif '国家' in col_lower or '国别' in col_lower or 'country' in col_lower:
+                self.country_col_combo.setCurrentIndex(i + 1)
+            elif '类型' in col_lower or '属性' in col_lower:
+                self.customer_type_col_combo.setCurrentIndex(i + 1)
     
     def show_data_preview(self):
         """显示数据预览"""
@@ -457,17 +564,29 @@ class LegalInfoImportWidget(QWidget):
         
         for i in range(len(preview_df)):
             for j, col in enumerate(preview_df.columns):
-                item = QTableWidgetItem(str(preview_df.iloc[i, j]))
+                value = preview_df.iloc[i, j]
+                item = QTableWidgetItem(str(value) if pd.notna(value) else "")
                 self.preview_table.setItem(i, j, item)
         
-        # 自适应列宽
         self.preview_table.resizeColumnsToContents()
     
     def update_import_button_state(self):
         """更新导入按钮状态"""
         has_datasource = self.datasource_combo.currentData() is not None
         has_file = bool(self.input_file)
-        self.import_btn.setEnabled(has_datasource and has_file)
+        legal_name_selected = (self.legal_name_col_combo.currentData() is not None and 
+                               self.legal_name_col_combo.currentData() >= 0)
+        
+        self.import_btn.setEnabled(has_datasource and has_file and legal_name_selected)
+    
+    def get_column_mapping(self):
+        """获取列映射配置"""
+        return {
+            'legal_name': self.legal_name_col_combo.currentData(),
+            'company_name': self.company_name_col_combo.currentData() if self.company_name_col_combo.currentData() >= 0 else None,
+            'country': self.country_col_combo.currentData() if self.country_col_combo.currentData() >= 0 else None,
+            'customer_type': self.customer_type_col_combo.currentData() if self.customer_type_col_combo.currentData() >= 0 else None
+        }
     
     def start_import(self):
         """开始导入"""
@@ -476,14 +595,25 @@ class LegalInfoImportWidget(QWidget):
             QMessageBox.warning(self, "警告", "请选择数据源和Excel文件！")
             return
         
-        # 确认对话框
+        column_mapping = self.get_column_mapping()
+        filter_corporate = self.filter_corporate_checkbox.isChecked()
+        
+        # 构建映射说明
+        mapping_info = []
+        mapping_info.append(f"法人姓名: {self.legal_name_col_combo.currentText()}")
+        mapping_info.append(f"公司名: {self.company_name_col_combo.currentText()}")
+        mapping_info.append(f"国家: {self.country_col_combo.currentText()}")
+        mapping_info.append(f"客户类型: {self.customer_type_col_combo.currentText()}")
+        mapping_info.append(f"只导入企业法人: {'是' if filter_corporate else '否'}")
+        
         reply = QMessageBox.question(
             self,
             "确认导入",
-            f"确定要将Excel数据导入到数据库 '{datasource.name}' 吗？\n\n"
-            f"数据将根据F列（国家）值插入到不同的法人信息表中：\n"
-            f"• 日本/JAPAN/JP → ba_rlb_legal_information表\n"
-            f"• 其他国家 → ba_rlb_legal_information_part2表",
+            f"确定要将Excel数据导入吗？\n\n"
+            f"数据库: {datasource.name}\n\n"
+            f"列映射配置:\n" + "\n".join(mapping_info) + "\n\n"
+            f"日本/JAPAN/JP → ba_rlb_legal_information表\n"
+            f"其他国家 → ba_rlb_legal_information_part2表",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
@@ -491,7 +621,6 @@ class LegalInfoImportWidget(QWidget):
         if reply != QMessageBox.Yes:
             return
         
-        # 禁用按钮，显示进度条
         self.import_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
@@ -500,8 +629,9 @@ class LegalInfoImportWidget(QWidget):
         self.error_records = []
         self.export_errors_btn.setEnabled(False)
         
-        # 启动工作线程
-        self.worker = LegalInfoImportWorker(self.input_file, datasource, self.db_manager)
+        self.worker = LegalInfoImportWorker(
+            self.input_file, datasource, self.db_manager, column_mapping, filter_corporate
+        )
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log_message.connect(self.append_log)
         self.worker.finished.connect(self.on_import_finished)
@@ -527,13 +657,13 @@ class LegalInfoImportWidget(QWidget):
             f"跳过(非企业法人)：{results['skipped_not_corporate']} 行\n"
             f"跳过(客户未找到)：{results['skipped_customer_not_found']} 行\n"
             f"跳过(重复记录)：{results['skipped_duplicate']} 行\n"
+            f"跳过(空值)：{results['skipped_empty']} 行\n"
             f"失败：{results['failed']} 行"
         )
         
         self.result_label.setText(result_text)
         self.result_label.setStyleSheet("color: green;")
         
-        # 如果有错误记录，启用导出按钮
         if self.error_records:
             self.export_errors_btn.setEnabled(True)
         

@@ -5,12 +5,33 @@ import os
 from datetime import datetime
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
                              QPushButton, QLabel, QMessageBox, QComboBox,
-                             QGroupBox, QProgressBar, QTextEdit, QFileDialog)
+                             QGroupBox, QProgressBar, QTextEdit, QFileDialog,
+                             QTableWidget, QTableWidgetItem, QScrollArea)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
 from database import DatabaseManager
 import pandas as pd
 import pymysql
+
+
+# 状态选项：数字 -> 中文
+STATUS_OPTIONS = {
+    0: "待指派",
+    1: "进行中",
+    2: "审核中",
+    3: "银行验证",
+    4: "审核失败",
+    5: "银行卡验证失败",
+    6: "完成",
+    7: "失败",
+    8: "取消",
+    9: "暂停",
+    10: "店铺验证失败",
+    11: "店铺验证中"
+}
+
+# 中文状态 -> 数字（用于从Excel读取状态）
+STATUS_NAME_TO_VALUE = {v: k for k, v in STATUS_OPTIONS.items()}
 
 
 class PtzcbRegisterWorker(QThread):
@@ -20,29 +41,45 @@ class PtzcbRegisterWorker(QThread):
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
     
-    def __init__(self, datasource, db_manager, excel_file, order_column, legal_column):
+    def __init__(self, datasource, db_manager, excel_file, column_mapping):
         super().__init__()
         self.datasource = datasource
         self.db_manager = db_manager
         self.excel_file = excel_file
-        self.order_column = order_column  # 订单编号列名
-        self.legal_column = legal_column  # 法人姓名列名
+        self.column_mapping = column_mapping  # 列映射字典
         self.results = {
             'total_rows': 0,
             'success_count': 0,
             'failed_count': 0,
+            'skipped_count': 0,
             'failed_records': [],
             'completed_data': []
         }
-        # 项目编号计数器
         self.project_counters = {}
+    
+    def get_cell_value(self, row, field_name):
+        """根据字段名获取单元格值"""
+        col_index = self.column_mapping.get(field_name)
+        if col_index is None or col_index < 0:
+            return ""
+        try:
+            value = row.iloc[col_index]
+            if pd.isna(value):
+                return ""
+            if isinstance(value, (int, float)) and value == int(value):
+                return str(int(value))
+            result = str(value)
+            if result.endswith('.0'):
+                result = result[:-2]
+            return result.strip()
+        except Exception:
+            return ""
     
     def run(self):
         try:
             self.log_message.emit("开始读取Excel文件...")
             self.progress.emit(5)
             
-            # 读取Excel文件
             try:
                 df = pd.read_excel(self.excel_file, engine='openpyxl')
                 self.log_message.emit(f"成功读取Excel文件，共 {len(df)} 行数据")
@@ -53,7 +90,6 @@ class PtzcbRegisterWorker(QThread):
             self.results['total_rows'] = len(df)
             self.progress.emit(10)
             
-            # 连接数据库
             self.log_message.emit("开始连接数据库...")
             connection = pymysql.connect(
                 host=self.datasource.host,
@@ -67,32 +103,28 @@ class PtzcbRegisterWorker(QThread):
             self.log_message.emit("数据库连接成功")
             self.progress.emit(15)
             
-            # 处理每一行数据
             for index, row in df.iterrows():
                 try:
-                    # 只处理订单编号列不为空的数据
-                    order_value = row[self.order_column] if self.order_column in row.index else ""
+                    order_value = self.get_cell_value(row, 'order_id')
                     
-                    if not order_value or str(order_value) == 'nan' or str(order_value).strip() == '':
+                    if not order_value:
                         self.log_message.emit(f"第{index + 1}行: 订单编号列为空，跳过处理")
+                        self.results['skipped_count'] += 1
                         continue
                     
                     project_id, primary_key_id = self.process_row(cursor, index + 1, row)
                     self.results['success_count'] += 1
                     
-                    # 记录完整数据
                     completed_row = row.to_dict()
                     completed_row['生成的项目编号'] = project_id
-                    completed_row['ba_ptzcb_register表主键ID'] = primary_key_id  # 明确标识这是ba_ptzcb_register表的主键
+                    completed_row['ba_ptzcb_register表主键ID'] = primary_key_id
                     completed_row['处理状态'] = '成功'
                     completed_row['处理时间'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     self.results['completed_data'].append(completed_row)
                     
-                    # 更新进度
                     progress = 15 + int((index + 1) / len(df) * 80)
                     self.progress.emit(progress)
                     
-                    # 每50行提交一次
                     if (index + 1) % 50 == 0:
                         connection.commit()
                         self.log_message.emit(f"已处理 {index + 1} 行，提交事务")
@@ -102,10 +134,9 @@ class PtzcbRegisterWorker(QThread):
                     error_msg = f"第{index + 1}行处理失败: {str(e)}"
                     self.log_message.emit(error_msg)
                     
-                    # 记录失败数据
                     failed_row = row.to_dict()
                     failed_row['生成的项目编号'] = ''
-                    failed_row['ba_ptzcb_register表主键ID'] = ''  # 明确标识这是ba_ptzcb_register表的主键
+                    failed_row['ba_ptzcb_register表主键ID'] = ''
                     failed_row['处理状态'] = '失败'
                     failed_row['失败原因'] = str(e)
                     failed_row['处理时间'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -117,7 +148,6 @@ class PtzcbRegisterWorker(QThread):
                         'data': row.to_dict()
                     })
             
-            # 最终提交
             connection.commit()
             cursor.close()
             connection.close()
@@ -131,60 +161,45 @@ class PtzcbRegisterWorker(QThread):
     def process_row(self, cursor, row_num, row):
         """处理单行数据"""
         try:
-            # 获取Excel列数据，处理数字格式
-            def clean_cell_value(cell_value):
-                """清理单元格值，去除.0后缀"""
-                if cell_value is None or str(cell_value) == 'nan':
-                    return ""
-                try:
-                    if isinstance(cell_value, (int, float)) and cell_value == int(cell_value):
-                        return str(int(cell_value))
-                    else:
-                        return str(cell_value).replace('.0', '') if str(cell_value).endswith('.0') else str(cell_value)
-                except:
-                    return str(cell_value)
+            order_id = self.get_cell_value(row, 'order_id')
+            legal_name = self.get_cell_value(row, 'legal_name')
+            dispose_username = self.get_cell_value(row, 'dispose_username')
+            company_name = self.get_cell_value(row, 'company_name')
+            country = self.get_cell_value(row, 'country')
+            attribute = self.get_cell_value(row, 'attribute')
+            project_prefix = self.get_cell_value(row, 'project_prefix')
+            current_progress = self.get_cell_value(row, 'current_progress')
+            project_start_time_str = self.get_cell_value(row, 'project_start_time')
+            get_store_time_str = self.get_cell_value(row, 'get_store_time')
+            register_submit_time_str = self.get_cell_value(row, 'register_submit_time')
+            time_consume = self.get_cell_value(row, 'time_consume')
+            status_text = self.get_cell_value(row, 'status')
             
-            col_a = clean_cell_value(row.iloc[0]) if len(row) > 0 else ""  # A列
-            col_c = clean_cell_value(row.iloc[2]) if len(row) > 2 else ""  # C列：dispose用户名
-            col_e = clean_cell_value(row.iloc[4]) if len(row) > 4 else ""  # E列：company_name
-            col_f = clean_cell_value(row.iloc[5]) if len(row) > 5 else ""  # F列：country
-            col_g = clean_cell_value(row.iloc[6]) if len(row) > 6 else ""  # G列：属性判断
-            col_h = clean_cell_value(row.iloc[7]) if len(row) > 7 else ""  # H列：项目前缀
-            col_i = clean_cell_value(row.iloc[8]) if len(row) > 8 else ""  # I列：current_progress
-            col_j = clean_cell_value(row.iloc[9]) if len(row) > 9 else ""  # J列：project_start_time
-            col_k = clean_cell_value(row.iloc[10]) if len(row) > 10 else ""  # K列：get_store_time
-            col_m = clean_cell_value(row.iloc[12]) if len(row) > 12 else ""  # M列：register_submit_time
-            col_n = clean_cell_value(row.iloc[13]) if len(row) > 13 else ""  # N列：time_consume
+            # 根据中文状态转换为数字
+            status_value = STATUS_NAME_TO_VALUE.get(status_text, 0)  # 默认为0(待指派)
+            if status_text and status_text not in STATUS_NAME_TO_VALUE:
+                self.log_message.emit(f"第{row_num}行: 状态'{status_text}'无法识别，使用默认值0(待指派)")
             
-            # 使用用户选择的列
-            order_id = clean_cell_value(row[self.order_column]) if self.order_column in row.index else ""  # 订单ID
-            legal_name = clean_cell_value(row[self.legal_column]) if self.legal_column in row.index else ""  # 法人姓名
+            self.log_message.emit(f"第{row_num}行: 处理数据 - 订单ID={order_id}, 法人姓名={legal_name}, 属性={attribute}, 前缀={project_prefix}")
             
-            self.log_message.emit(f"第{row_num}行: 处理数据 - 订单ID={order_id}, 法人姓名={legal_name}, 属性={col_g}, 前缀={col_h}")
+            full_prefix = self.generate_project_prefix(project_prefix)
             
-            # 第一步：生成项目编号前缀
-            project_prefix = self.generate_project_prefix(col_h)
-            
-            # 第二步：根据属性判断查找shopindex_id
-            shopindex_info = self.find_shopindex_info(cursor, legal_name, col_e, col_g, col_f, row_num)
+            shopindex_info = self.find_shopindex_info(cursor, legal_name, company_name, attribute, country, row_num)
             if not shopindex_info:
                 raise Exception("未找到对应的shopindex信息")
             
             shopindex_id, shopindex_data = shopindex_info
             
-            # 第三步：生成完整项目编号
-            project_id = self.generate_project_id(project_prefix, shopindex_data['shopindex_id'])
+            project_id = self.generate_project_id(full_prefix, shopindex_data['shopindex_id'])
             
-            # 第四步：查找order_id对应的订单信息
             order_info = self.get_order_info(cursor, order_id, legal_name)
             
-            # 第五步：查找dispose_id
-            dispose_id = self.get_dispose_id(cursor, col_c) if col_c and col_c != 'nan' else None
+            dispose_id = self.get_dispose_id(cursor, dispose_username) if dispose_username else None
             
-            # 第六步：插入ba_ptzcb_register记录
             primary_key_id = self.insert_ptzcb_register(cursor, project_id, order_id, legal_name, shopindex_data, 
-                                                       order_info, dispose_id, col_e, col_f, col_i, 
-                                                       col_j, col_k, col_m, col_n, row_num)
+                                                       order_info, dispose_id, company_name, country, current_progress,
+                                                       project_start_time_str, get_store_time_str, register_submit_time_str, 
+                                                       time_consume, status_value, row_num)
             
             self.log_message.emit(f"第{row_num}行: 成功创建项目 {project_id}，主键ID: {primary_key_id}")
             
@@ -196,15 +211,14 @@ class PtzcbRegisterWorker(QThread):
     def generate_project_prefix(self, col_h):
         """生成项目编号前缀: H列值 + PT + 年份缩写 + 月日"""
         today = datetime.now()
-        year_short = str(today.year)[2:]  # 2026 -> 26
-        month_day = today.strftime('%m%d')  # 0129
+        year_short = str(today.year)[2:]
+        month_day = today.strftime('%m%d')
         prefix = f"{col_h}PT{year_short}{month_day}"
         return prefix
     
     def find_shopindex_info(self, cursor, legal_name, company_name, attribute, country, row_num):
         """根据属性判断查找shopindex信息"""
         try:
-            # 先通过legal_name找到customer_id
             cursor.execute("""
                 SELECT id FROM ba_rlb_customer 
                 WHERE legal_name = %s AND (delete_time IS NULL OR delete_time = 0)
@@ -217,9 +231,7 @@ class PtzcbRegisterWorker(QThread):
             customer_id = customer_result[0]
             self.log_message.emit(f"第{row_num}行: 找到客户ID={customer_id}")
             
-            # 判断属性类型
             if attribute != '企业法人':
-                # 非企业法人：查找belong_information为null的shopindex
                 cursor.execute("""
                     SELECT id, shopindex_id, legal_id FROM ba_shopindex 
                     WHERE legal_id = %s AND belong_information IS NULL 
@@ -232,7 +244,7 @@ class PtzcbRegisterWorker(QThread):
                 
                 shopindex_id, shopindex_code, legal_id = shopindex_result
                 return shopindex_id, {
-                    'id': shopindex_id,  # ba_shopindex表的id
+                    'id': shopindex_id,
                     'shopindex_id': shopindex_code,
                     'legal_id': legal_id,
                     'customer_id': customer_id,
@@ -241,9 +253,7 @@ class PtzcbRegisterWorker(QThread):
                 }
             
             else:
-                # 企业法人：根据F列（国家）判断查找哪个表
-                if country.upper() == "日本" or country.upper() == "JAPAN" or country.upper() == "JP":
-                    # 日区企业法人：ba_rlb_legal_information
+                if country.upper() in ["日本", "JAPAN", "JP"]:
                     cursor.execute("""
                         SELECT id FROM ba_rlb_legal_information 
                         WHERE legal_id = %s AND company_name = %s 
@@ -256,7 +266,6 @@ class PtzcbRegisterWorker(QThread):
                     
                     information_id = legal_info_result[0]
                     
-                    # 查找对应的shopindex (belong_information = 1)
                     cursor.execute("""
                         SELECT id, shopindex_id, legal_id FROM ba_shopindex 
                         WHERE legal_id = %s AND belong_information = 1 
@@ -269,7 +278,7 @@ class PtzcbRegisterWorker(QThread):
                     
                     shopindex_id, shopindex_code, legal_id = shopindex_result
                     return shopindex_id, {
-                        'id': shopindex_id,  # ba_shopindex表的id
+                        'id': shopindex_id,
                         'shopindex_id': shopindex_code,
                         'legal_id': legal_id,
                         'customer_id': customer_id,
@@ -278,7 +287,6 @@ class PtzcbRegisterWorker(QThread):
                     }
                 
                 else:
-                    # 非日区企业法人：ba_rlb_legal_information_part2
                     cursor.execute("""
                         SELECT id FROM ba_rlb_legal_information_part2 
                         WHERE legal_id = %s AND company_name = %s 
@@ -291,7 +299,6 @@ class PtzcbRegisterWorker(QThread):
                     
                     information_part2_id = legal_info_result[0]
                     
-                    # 查找对应的shopindex (belong_information = 2)
                     cursor.execute("""
                         SELECT id, shopindex_id, legal_id FROM ba_shopindex 
                         WHERE legal_id = %s AND belong_information = 2 
@@ -304,7 +311,7 @@ class PtzcbRegisterWorker(QThread):
                     
                     shopindex_id, shopindex_code, legal_id = shopindex_result
                     return shopindex_id, {
-                        'id': shopindex_id,  # ba_shopindex表的id
+                        'id': shopindex_id,
                         'shopindex_id': shopindex_code,
                         'legal_id': legal_id,
                         'customer_id': customer_id,
@@ -317,16 +324,13 @@ class PtzcbRegisterWorker(QThread):
     
     def generate_project_id(self, prefix, shopindex_code):
         """生成完整项目编号: 前缀 + shopindex_code + 序号"""
-        # 生成基础项目编号
         base_project_id = f"{prefix}{shopindex_code}"
         
-        # 获取或初始化计数器
         if base_project_id not in self.project_counters:
             self.project_counters[base_project_id] = 1
         else:
             self.project_counters[base_project_id] += 1
         
-        # 生成完整项目编号
         counter = self.project_counters[base_project_id]
         full_project_id = f"{base_project_id}{counter:03d}"
         
@@ -374,11 +378,10 @@ class PtzcbRegisterWorker(QThread):
     
     def parse_datetime(self, date_str):
         """解析日期时间字符串"""
-        if not date_str or date_str == 'nan':
+        if not date_str:
             return None
         
         try:
-            # 尝试多种日期格式
             formats = [
                 '%Y-%m-%d %H:%M:%S',
                 '%Y-%m-%d',
@@ -394,7 +397,6 @@ class PtzcbRegisterWorker(QThread):
                 except ValueError:
                     continue
             
-            # 如果都不匹配，返回None
             return None
             
         except Exception:
@@ -402,52 +404,45 @@ class PtzcbRegisterWorker(QThread):
     
     def insert_ptzcb_register(self, cursor, project_id, order_id_str, legal_name, shopindex_data, 
                              order_info, dispose_id, company_name, country, current_progress,
-                             project_start_time_str, get_store_time_str, register_submit_time_str, time_consume, row_num):
+                             project_start_time_str, get_store_time_str, register_submit_time_str, time_consume, status_value, row_num):
         """插入ba_ptzcb_register记录"""
         try:
-            # 设置创建时间为2025-01-01 00:00:00的时间戳
             create_time = int(datetime(2025, 1, 1, 0, 0, 0).timestamp())
             current_time = int(datetime.now().timestamp())
             
-            # 解析时间字段
             project_start_time = self.parse_datetime(project_start_time_str)
             get_store_time = self.parse_datetime(get_store_time_str)
             register_submit_time = self.parse_datetime(register_submit_time_str)
             done_time = datetime.now()
             
-            # 构建插入数据
             insert_data = {
                 'project_id': project_id,
                 'order_id': order_info['order_id'],
-                'status': 6,  # 完成
-                'current_progress': current_progress if current_progress and current_progress != 'nan' else '',
-                'done_time': done_time,
+                'status': status_value,  # 使用从Excel读取并转换的状态值
+                'current_progress': current_progress if current_progress else '',
+                'done_time': done_time if status_value == 6 else None,  # 只有完成状态才设置done_time
                 'admin_id': 1,
                 'dept_id': 1,
                 'remark': '系统脚本自动录入',
-                'create_time': create_time,  # 使用2025-01-01的时间戳
+                'create_time': create_time,
                 'update_time': current_time,
-                'shopindex_id': shopindex_data['id'],  # ba_shopindex的id
+                'shopindex_id': shopindex_data['id'],
                 'shudi_id': order_info['shudi_id'],
                 'platform_id': order_info['platform_id'],
                 'bank_card_type': order_info['bank_card_type'],
                 'currency_id': order_info['currency_id'],
                 'customer_id': shopindex_data['customer_id'],
-                'company_name': company_name if company_name and company_name != 'nan' else '',
-                'country': country if country and country != 'nan' else ''
+                'company_name': company_name if company_name else '',
+                'country': country if country else ''
             }
             
-            # 添加time_consume字段（只有有值时才添加）
-            if time_consume and time_consume != 'nan' and str(time_consume).strip():
+            if time_consume:
                 try:
-                    # 尝试转换为数字
                     time_consume_value = float(time_consume)
                     insert_data['time_consume'] = time_consume_value
                 except (ValueError, TypeError):
-                    # 如果转换失败，记录日志但不添加字段
                     self.log_message.emit(f"第{row_num}行: time_consume值'{time_consume}'无法转换为数字，跳过该字段")
             
-            # 添加可选字段
             if dispose_id:
                 insert_data['dispose_id'] = dispose_id
             
@@ -460,14 +455,15 @@ class PtzcbRegisterWorker(QThread):
             if register_submit_time:
                 insert_data['register_submit_time'] = register_submit_time
             
-            # 根据shopindex信息设置information相关字段
             if shopindex_data['information_id']:
                 insert_data['information_id'] = shopindex_data['information_id']
             
             if shopindex_data['information_part2_id']:
                 insert_data['information_part2_id'] = shopindex_data['information_part2_id']
             
-            # 构建SQL
+            # 移除值为None的字段
+            insert_data = {k: v for k, v in insert_data.items() if v is not None}
+            
             fields = list(insert_data.keys())
             placeholders = ['%s'] * len(fields)
             values = list(insert_data.values())
@@ -479,10 +475,9 @@ class PtzcbRegisterWorker(QThread):
             
             cursor.execute(insert_sql, values)
             
-            # 获取插入后的主键ID
             primary_key_id = cursor.lastrowid
             
-            self.log_message.emit(f"第{row_num}行: 插入项目数据 - 项目编号:{project_id}, shopindex_id:{shopindex_data['legal_id']}")
+            self.log_message.emit(f"第{row_num}行: 插入项目数据 - 项目编号:{project_id}, shopindex_id:{shopindex_data['legal_id']}, 状态:{status_value}({STATUS_OPTIONS.get(status_value, '未知')})")
             
             return primary_key_id
             
@@ -497,7 +492,8 @@ class PtzcbRegisterWidget(QWidget):
         super().__init__()
         self.db_manager = db_manager
         self.excel_file = None
-        self.excel_columns = []  # 存储Excel列名
+        self.excel_data = None
+        self.excel_columns = []
         self.failed_records = []
         self.completed_data = []
         self.init_ui()
@@ -505,6 +501,11 @@ class PtzcbRegisterWidget(QWidget):
     
     def init_ui(self):
         """初始化UI"""
+        main_layout = QVBoxLayout()
+        
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_widget = QWidget()
         layout = QVBoxLayout()
         
         # 数据源选择区域
@@ -541,20 +542,97 @@ class PtzcbRegisterWidget(QWidget):
         file_group.setLayout(file_layout)
         layout.addWidget(file_group)
         
-        # 列选择区域
-        column_group = QGroupBox("列选择")
-        column_layout = QFormLayout()
+        # 状态说明区域
+        status_info_group = QGroupBox("状态对照表")
+        status_info_layout = QVBoxLayout()
         
-        self.order_column_combo = QComboBox()
-        self.order_column_combo.setEnabled(False)
-        column_layout.addRow("订单编号列:", self.order_column_combo)
+        status_info_label = QLabel(
+            "Excel中的状态列会自动转换为数字状态：<br>"
+            "<b>待指派→0, 进行中→1, 审核中→2, 银行验证→3, 审核失败→4, 银行卡验证失败→5,<br>"
+            "完成→6, 失败→7, 取消→8, 暂停→9, 店铺验证失败→10, 店铺验证中→11</b>"
+        )
+        status_info_label.setWordWrap(True)
+        status_info_layout.addWidget(status_info_label)
         
-        self.legal_column_combo = QComboBox()
-        self.legal_column_combo.setEnabled(False)
-        column_layout.addRow("法人姓名列:", self.legal_column_combo)
+        status_info_group.setLayout(status_info_layout)
+        layout.addWidget(status_info_group)
         
-        column_group.setLayout(column_layout)
-        layout.addWidget(column_group)
+        # 列映射配置区域
+        mapping_group = QGroupBox("列映射配置（选择Excel文件后可配置）")
+        mapping_layout = QFormLayout()
+        
+        # 必选列
+        self.order_col_combo = QComboBox()
+        self.order_col_combo.setEnabled(False)
+        self.order_col_combo.currentIndexChanged.connect(self.update_start_button_state)
+        mapping_layout.addRow("订单编号列 (必选，用于查找ba_order):", self.order_col_combo)
+        
+        self.legal_name_col_combo = QComboBox()
+        self.legal_name_col_combo.setEnabled(False)
+        self.legal_name_col_combo.currentIndexChanged.connect(self.update_start_button_state)
+        mapping_layout.addRow("法人姓名列 (必选，用于查找客户):", self.legal_name_col_combo)
+        
+        self.attribute_col_combo = QComboBox()
+        self.attribute_col_combo.setEnabled(False)
+        self.attribute_col_combo.currentIndexChanged.connect(self.update_start_button_state)
+        mapping_layout.addRow("属性列 (必选，判断是否企业法人):", self.attribute_col_combo)
+        
+        self.project_prefix_col_combo = QComboBox()
+        self.project_prefix_col_combo.setEnabled(False)
+        self.project_prefix_col_combo.currentIndexChanged.connect(self.update_start_button_state)
+        mapping_layout.addRow("项目前缀列 (必选，如FR、JP等):", self.project_prefix_col_combo)
+        
+        self.status_col_combo = QComboBox()
+        self.status_col_combo.setEnabled(False)
+        self.status_col_combo.currentIndexChanged.connect(self.update_start_button_state)
+        mapping_layout.addRow("状态列 (必选，中文状态如'完成'、'进行中'):", self.status_col_combo)
+        
+        # 可选列
+        self.dispose_col_combo = QComboBox()
+        self.dispose_col_combo.setEnabled(False)
+        mapping_layout.addRow("指派人列 (可选，匹配ba_admin):", self.dispose_col_combo)
+        
+        self.company_col_combo = QComboBox()
+        self.company_col_combo.setEnabled(False)
+        mapping_layout.addRow("公司名列 (企业法人时必填):", self.company_col_combo)
+        
+        self.country_col_combo = QComboBox()
+        self.country_col_combo.setEnabled(False)
+        mapping_layout.addRow("国家列 (企业法人时必填):", self.country_col_combo)
+        
+        self.progress_col_combo = QComboBox()
+        self.progress_col_combo.setEnabled(False)
+        mapping_layout.addRow("当前进度列 (可选):", self.progress_col_combo)
+        
+        self.start_time_col_combo = QComboBox()
+        self.start_time_col_combo.setEnabled(False)
+        mapping_layout.addRow("立项时间列 (可选):", self.start_time_col_combo)
+        
+        self.store_time_col_combo = QComboBox()
+        self.store_time_col_combo.setEnabled(False)
+        mapping_layout.addRow("拿店时间列 (可选):", self.store_time_col_combo)
+        
+        self.submit_time_col_combo = QComboBox()
+        self.submit_time_col_combo.setEnabled(False)
+        mapping_layout.addRow("注册提交时间列 (可选):", self.submit_time_col_combo)
+        
+        self.time_consume_col_combo = QComboBox()
+        self.time_consume_col_combo.setEnabled(False)
+        mapping_layout.addRow("耗时列 (可选):", self.time_consume_col_combo)
+        
+        mapping_group.setLayout(mapping_layout)
+        layout.addWidget(mapping_group)
+        
+        # 数据预览区域
+        preview_group = QGroupBox("数据预览（前5行）")
+        preview_layout = QVBoxLayout()
+        
+        self.preview_table = QTableWidget()
+        self.preview_table.setMaximumHeight(150)
+        preview_layout.addWidget(self.preview_table)
+        
+        preview_group.setLayout(preview_layout)
+        layout.addWidget(preview_group)
         
         # 功能说明区域
         info_group = QGroupBox("功能说明")
@@ -562,38 +640,15 @@ class PtzcbRegisterWidget(QWidget):
         
         info_label = QLabel("""
 <b>根据Excel补充系统平台注册部表信息说明:</b><br>
-<b>使用步骤:</b><br>
-1. 选择Excel文件后，系统会自动读取表头<br>
-2. 在"列选择"区域选择对应的列：<br>
-   • <b>订单编号列</b>: 用于查找ba_order表（必填，只处理此列不为空的数据）<br>
-   • <b>法人姓名列</b>: 用于查找客户信息（必填）<br><br>
-<b>Excel列要求（按固定位置）:</b><br>
-• A列: 数据列<br>
-• C列: 指派人用户名<br>
-• E列: 公司名称 (企业法人时使用)<br>
-• F列: 国家<br>
-• G列: 属性判断 (是否企业法人)<br>
-• H列: 项目前缀 (如FR、JP等)<br>
-• I列: 当前进度<br>
-• J列: 立项时间<br>
-• K列: 拿店时间<br>
-• M列: 注册提交时间<br>
-• N列: 耗时信息<br><br>
-<b>项目编号生成规则:</b><br>
-• 格式: H列值 + PT + 年份缩写 + 月日 + shopindex编号 + 序号<br>
-• 示例: FRPT260129C00987001<br>
-• FR(H列) + PT + 26(年份) + 0129(月日) + C00987(shopindex) + 001(序号)<br><br>
+<b>状态说明:</b> 0=待指派, 1=进行中, 2=审核中, 3=银行验证, 4=审核失败, 5=银行卡验证失败, 6=完成, 7=失败, 8=取消, 9=暂停, 10=店铺验证失败, 11=店铺验证中<br><br>
+<b>必选列:</b> 订单编号、法人姓名、属性、项目前缀<br>
+<b>企业法人必填:</b> 公司名、国家<br><br>
+<b>项目编号生成规则:</b> 前缀列值 + PT + 年份缩写 + 月日 + shopindex编号 + 序号<br>
+<b>示例:</b> FRPT260129C00987001 = FR(前缀) + PT + 26(年份) + 0129(月日) + C00987(shopindex) + 001(序号)<br><br>
 <b>shopindex查找规则:</b><br>
-• <b>非企业法人</b>: 通过法人姓名找customer_id → ba_shopindex(belong_information=null)<br>
-• <b>企业法人+日本</b>: customer_id+E列 → ba_rlb_legal_information → ba_shopindex(belong_information=1)<br>
-  &nbsp;&nbsp;- F列为"日本"、"JAPAN"或"JP"时<br>
-• <b>企业法人+非日本</b>: customer_id+E列 → ba_rlb_legal_information_part2 → ba_shopindex(belong_information=2)<br>
-  &nbsp;&nbsp;- F列不是日本时<br><br>
-<b>数据补充:</b><br>
-• 从ba_order获取: shudi_id, platform_id, currency_id, bank_card_type<br>
-• 从ba_admin获取: dispose_id (根据C列用户名)<br>
-• 时间字段自动解析多种格式<br>
-• 状态固定为6(完成), admin_id和dept_id为1
+• 非企业法人: 通过法人姓名找customer_id → ba_shopindex(belong_information=null)<br>
+• 企业法人+日本: customer_id+公司名 → ba_rlb_legal_information → ba_shopindex(belong_information=1)<br>
+• 企业法人+非日本: customer_id+公司名 → ba_rlb_legal_information_part2 → ba_shopindex(belong_information=2)
         """)
         info_label.setWordWrap(True)
         info_layout.addWidget(info_label)
@@ -621,7 +676,6 @@ class PtzcbRegisterWidget(QWidget):
         
         button_layout.addStretch()
         
-        # 进度条
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         button_layout.addWidget(self.progress_bar)
@@ -633,7 +687,7 @@ class PtzcbRegisterWidget(QWidget):
         log_layout = QVBoxLayout()
         
         self.log_text = QTextEdit()
-        self.log_text.setMaximumHeight(200)
+        self.log_text.setMaximumHeight(150)
         self.log_text.setReadOnly(True)
         log_layout.addWidget(self.log_text)
         
@@ -656,7 +710,11 @@ class PtzcbRegisterWidget(QWidget):
         self.result_label.setFont(font)
         layout.addWidget(self.result_label)
         
-        self.setLayout(layout)
+        scroll_widget.setLayout(layout)
+        scroll_area.setWidget(scroll_widget)
+        main_layout.addWidget(scroll_area)
+        
+        self.setLayout(main_layout)
     
     def load_datasources(self):
         """加载数据源列表"""
@@ -696,38 +754,19 @@ class PtzcbRegisterWidget(QWidget):
         
         if file_path:
             try:
-                # 读取Excel表头
-                df = pd.read_excel(file_path, engine='openpyxl', nrows=0)
+                df = pd.read_excel(file_path, engine='openpyxl')
+                self.excel_data = df
                 self.excel_columns = list(df.columns)
                 
-                # 更新UI
                 self.excel_file = file_path
                 self.file_label.setText(os.path.basename(file_path))
                 self.file_label.setStyleSheet("color: green;")
                 
-                # 填充列选择下拉框
-                self.order_column_combo.clear()
-                self.order_column_combo.addItems(self.excel_columns)
-                self.order_column_combo.setEnabled(True)
+                self.populate_column_combos()
+                self.auto_match_columns(self.excel_columns)
+                self.show_data_preview()
                 
-                self.legal_column_combo.clear()
-                self.legal_column_combo.addItems(self.excel_columns)
-                self.legal_column_combo.setEnabled(True)
-                
-                # 尝试自动选择默认列（如果存在）
-                # 订单编号列可能叫"订单编号"、"order"等
-                for i, col in enumerate(self.excel_columns):
-                    if '订单' in str(col) or 'order' in str(col).lower():
-                        self.order_column_combo.setCurrentIndex(i)
-                        break
-                
-                # 法人姓名列可能叫"法人姓名"、"姓名"等
-                for i, col in enumerate(self.excel_columns):
-                    if '法人' in str(col) or '姓名' in str(col):
-                        self.legal_column_combo.setCurrentIndex(i)
-                        break
-                
-                self.log_text.append(f"成功读取Excel表头，共 {len(self.excel_columns)} 列")
+                self.log_text.append(f"成功读取Excel文件，共 {len(df)} 行数据，{len(self.excel_columns)} 列")
                 self.log_text.append(f"列名: {', '.join(self.excel_columns)}")
                 
                 self.update_start_button_state()
@@ -735,14 +774,134 @@ class PtzcbRegisterWidget(QWidget):
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"读取Excel文件失败: {str(e)}")
                 self.excel_file = None
+                self.excel_data = None
                 self.file_label.setText("未选择文件")
                 self.file_label.setStyleSheet("color: gray;")
+    
+    def populate_column_combos(self):
+        """填充列选择下拉框"""
+        all_combos = [
+            self.order_col_combo,
+            self.legal_name_col_combo,
+            self.attribute_col_combo,
+            self.project_prefix_col_combo,
+            self.status_col_combo,
+            self.dispose_col_combo,
+            self.company_col_combo,
+            self.country_col_combo,
+            self.progress_col_combo,
+            self.start_time_col_combo,
+            self.store_time_col_combo,
+            self.submit_time_col_combo,
+            self.time_consume_col_combo
+        ]
+        
+        for combo in all_combos:
+            combo.clear()
+            combo.addItem("-- 不选择 --", -1)
+            for i, col in enumerate(self.excel_columns):
+                combo.addItem(f"{i+1}. {col}", i)
+            combo.setEnabled(True)
+    
+    def auto_match_columns(self, columns):
+        """自动匹配列"""
+        column_keywords = {
+            'order_id': ['订单', 'order', '编号'],
+            'legal_name': ['法人', '姓名', 'legal'],
+            'attribute': ['属性', '类型'],
+            'project_prefix': ['前缀', 'prefix'],
+            'status': ['状态', 'status'],
+            'dispose': ['指派', '担当', 'dispose'],
+            'company': ['公司', 'company', '企业'],
+            'country': ['国家', '国别', 'country'],
+            'progress': ['进度', 'progress'],
+            'start_time': ['立项', '开始'],
+            'store_time': ['拿店', '店铺时间'],
+            'submit_time': ['提交', 'submit'],
+            'time_consume': ['耗时', '时长', 'consume']
+        }
+        
+        combo_mapping = {
+            'order_id': self.order_col_combo,
+            'legal_name': self.legal_name_col_combo,
+            'attribute': self.attribute_col_combo,
+            'project_prefix': self.project_prefix_col_combo,
+            'status': self.status_col_combo,
+            'dispose': self.dispose_col_combo,
+            'company': self.company_col_combo,
+            'country': self.country_col_combo,
+            'progress': self.progress_col_combo,
+            'start_time': self.start_time_col_combo,
+            'store_time': self.store_time_col_combo,
+            'submit_time': self.submit_time_col_combo,
+            'time_consume': self.time_consume_col_combo
+        }
+        
+        for field, keywords in column_keywords.items():
+            combo = combo_mapping[field]
+            for i, col in enumerate(columns):
+                col_lower = str(col).lower()
+                for keyword in keywords:
+                    if keyword.lower() in col_lower:
+                        combo.setCurrentIndex(i + 1)  # +1 因为第一个是"不选择"
+                        break
+                else:
+                    continue
+                break
+    
+    def show_data_preview(self):
+        """显示数据预览"""
+        if self.excel_data is None:
+            return
+        
+        preview_df = self.excel_data.head(5)
+        
+        self.preview_table.clear()
+        self.preview_table.setRowCount(len(preview_df))
+        self.preview_table.setColumnCount(len(preview_df.columns))
+        self.preview_table.setHorizontalHeaderLabels([str(col) for col in preview_df.columns])
+        
+        for row_idx, (_, row) in enumerate(preview_df.iterrows()):
+            for col_idx, value in enumerate(row):
+                cell_value = "" if pd.isna(value) else str(value)
+                item = QTableWidgetItem(cell_value)
+                self.preview_table.setItem(row_idx, col_idx, item)
+        
+        self.preview_table.resizeColumnsToContents()
+    
+    def get_column_mapping(self):
+        """获取列映射"""
+        return {
+            'order_id': self.order_col_combo.currentData(),
+            'legal_name': self.legal_name_col_combo.currentData(),
+            'attribute': self.attribute_col_combo.currentData(),
+            'project_prefix': self.project_prefix_col_combo.currentData(),
+            'status': self.status_col_combo.currentData(),
+            'dispose_username': self.dispose_col_combo.currentData(),
+            'company_name': self.company_col_combo.currentData(),
+            'country': self.country_col_combo.currentData(),
+            'current_progress': self.progress_col_combo.currentData(),
+            'project_start_time': self.start_time_col_combo.currentData(),
+            'get_store_time': self.store_time_col_combo.currentData(),
+            'register_submit_time': self.submit_time_col_combo.currentData(),
+            'time_consume': self.time_consume_col_combo.currentData()
+        }
     
     def update_start_button_state(self):
         """更新开始按钮状态"""
         datasource_selected = self.datasource_combo.currentData() is not None
         file_selected = self.excel_file is not None
-        self.start_btn.setEnabled(datasource_selected and file_selected)
+        
+        # 检查必选列
+        order_selected = self.order_col_combo.currentData() is not None and self.order_col_combo.currentData() >= 0
+        legal_selected = self.legal_name_col_combo.currentData() is not None and self.legal_name_col_combo.currentData() >= 0
+        attribute_selected = self.attribute_col_combo.currentData() is not None and self.attribute_col_combo.currentData() >= 0
+        prefix_selected = self.project_prefix_col_combo.currentData() is not None and self.project_prefix_col_combo.currentData() >= 0
+        status_selected = self.status_col_combo.currentData() is not None and self.status_col_combo.currentData() >= 0
+        
+        all_required = order_selected and legal_selected and attribute_selected and prefix_selected and status_selected
+        
+        self.start_btn.setEnabled(datasource_selected and file_selected and all_required)
     
     def start_process(self):
         """开始补充"""
@@ -751,23 +910,31 @@ class PtzcbRegisterWidget(QWidget):
             QMessageBox.warning(self, "警告", "请选择数据源和Excel文件！")
             return
         
-        # 获取选择的列
-        order_column = self.order_column_combo.currentText()
-        legal_column = self.legal_column_combo.currentText()
+        column_mapping = self.get_column_mapping()
         
-        if not order_column or not legal_column:
-            QMessageBox.warning(self, "警告", "请选择订单编号列和法人姓名列！")
-            return
+        # 构建列映射信息
+        mapping_info = []
+        mapping_info.append(f"• 订单编号列: {self.order_col_combo.currentText()}")
+        mapping_info.append(f"• 法人姓名列: {self.legal_name_col_combo.currentText()}")
+        mapping_info.append(f"• 属性列: {self.attribute_col_combo.currentText()}")
+        mapping_info.append(f"• 项目前缀列: {self.project_prefix_col_combo.currentText()}")
+        mapping_info.append(f"• 状态列: {self.status_col_combo.currentText()}")
         
-        # 确认对话框
+        if self.dispose_col_combo.currentData() >= 0:
+            mapping_info.append(f"• 指派人列: {self.dispose_col_combo.currentText()}")
+        if self.company_col_combo.currentData() >= 0:
+            mapping_info.append(f"• 公司名列: {self.company_col_combo.currentText()}")
+        if self.country_col_combo.currentData() >= 0:
+            mapping_info.append(f"• 国家列: {self.country_col_combo.currentText()}")
+        
         reply = QMessageBox.question(
             self,
             "确认补充",
             f"确定要补充平台注册部表信息吗？\n\n"
             f"数据库: {datasource.name}\n"
-            f"Excel文件: {os.path.basename(self.excel_file)}\n"
-            f"订单编号列: {order_column}\n"
-            f"法人姓名列: {legal_column}\n\n"
+            f"Excel文件: {os.path.basename(self.excel_file)}\n\n"
+            f"列映射:\n" + "\n".join(mapping_info) + "\n\n"
+            f"状态将根据Excel状态列的中文值自动转换为数字。\n"
             f"此操作将根据Excel数据创建ba_ptzcb_register记录。\n"
             f"只处理订单编号列不为空的数据行。\n"
             f"操作不可撤销，请确认数据正确！",
@@ -778,7 +945,6 @@ class PtzcbRegisterWidget(QWidget):
         if reply != QMessageBox.Yes:
             return
         
-        # 禁用按钮，显示进度条
         self.start_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
@@ -787,8 +953,7 @@ class PtzcbRegisterWidget(QWidget):
         self.failed_records = []
         self.completed_data = []
         
-        # 启动工作线程
-        self.worker = PtzcbRegisterWorker(datasource, self.db_manager, self.excel_file, order_column, legal_column)
+        self.worker = PtzcbRegisterWorker(datasource, self.db_manager, self.excel_file, column_mapping)
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log_message.connect(self.append_log)
         self.worker.finished.connect(self.on_process_finished)
@@ -811,6 +976,7 @@ class PtzcbRegisterWidget(QWidget):
             f"补充完成！\n"
             f"总行数：{results['total_rows']} 行\n"
             f"成功：{results['success_count']} 行\n"
+            f"跳过（订单为空）：{results['skipped_count']} 行\n"
             f"失败：{results['failed_count']} 行"
         )
         
@@ -821,7 +987,6 @@ class PtzcbRegisterWidget(QWidget):
         else:
             self.result_label.setStyleSheet("color: green;")
         
-        # 启用导出完整结果按钮
         self.export_completed_btn.setEnabled(True)
         
         QMessageBox.information(self, "补充完成", result_text)
@@ -850,11 +1015,10 @@ class PtzcbRegisterWidget(QWidget):
         
         if file_path:
             try:
-                # 创建DataFrame并导出
                 df = pd.DataFrame(self.completed_data)
                 df.to_excel(file_path, index=False, engine='openpyxl')
                 
-                QMessageBox.information(self, "导出成功", f"完整结果已导出到：\n{file_path}\n\n包含字段：\n• 原始Excel所有列（AB列保持订单主键ID）\n• 生成的项目编号\n• ba_ptzcb_register表主键ID\n• 处理状态\n• 处理时间\n• 失败原因（如有）")
+                QMessageBox.information(self, "导出成功", f"完整结果已导出到：\n{file_path}")
                 
             except Exception as e:
                 QMessageBox.critical(self, "导出失败", f"导出完整结果时出错：{str(e)}")
@@ -874,7 +1038,6 @@ class PtzcbRegisterWidget(QWidget):
         
         if file_path:
             try:
-                # 准备导出数据
                 export_data = []
                 for record in self.failed_records:
                     row_data = record['data'].copy()
@@ -882,7 +1045,6 @@ class PtzcbRegisterWidget(QWidget):
                     row_data['错误原因'] = record['error']
                     export_data.append(row_data)
                 
-                # 创建DataFrame并导出
                 df = pd.DataFrame(export_data)
                 df.to_excel(file_path, index=False, engine='openpyxl')
                 

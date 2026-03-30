@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
                              QPushButton, QLabel, QFileDialog, QMessageBox,
                              QTableWidget, QTableWidgetItem, QComboBox,
                              QGroupBox, QProgressBar, QLineEdit, QTextEdit,
-                             QCheckBox, QSpinBox)
+                             QCheckBox, QSpinBox, QHeaderView)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
 from database import DatabaseManager
@@ -19,18 +19,21 @@ class ExcelToDbWorker(QThread):
     """Excel导入数据库工作线程"""
     progress = pyqtSignal(int)
     log_message = pyqtSignal(str)
-    finished = pyqtSignal(dict)  # 返回统计结果
+    finished = pyqtSignal(dict)
     error = pyqtSignal(str)
     
-    def __init__(self, input_file, datasource, db_manager):
+    def __init__(self, input_file, datasource, db_manager, column_mapping, check_field):
         super().__init__()
         self.input_file = input_file
         self.datasource = datasource
         self.db_manager = db_manager
+        self.column_mapping = column_mapping
+        self.check_field = check_field
         self.results = {
             'total': 0,
             'success': 0,
-            'skipped': 0,
+            'skipped_empty': 0,
+            'skipped_exists': 0,
             'failed': 0,
             'logs': []
         }
@@ -40,7 +43,6 @@ class ExcelToDbWorker(QThread):
             self.log_message.emit("开始读取Excel文件...")
             self.progress.emit(5)
             
-            # 读取Excel文件
             if self.input_file.endswith('.xlsx'):
                 try:
                     df = pd.read_excel(self.input_file, engine='openpyxl', header=0)
@@ -63,7 +65,6 @@ class ExcelToDbWorker(QThread):
             self.log_message.emit(f"读取到 {len(df)} 行数据")
             self.progress.emit(10)
             
-            # 连接数据库
             self.log_message.emit("连接数据库...")
             connection = pymysql.connect(
                 host=self.datasource.host,
@@ -77,67 +78,64 @@ class ExcelToDbWorker(QThread):
             cursor = connection.cursor()
             self.progress.emit(15)
             
-            # 处理每一行数据
             for index, row in df.iterrows():
                 try:
                     progress = 15 + int((index / len(df)) * 80)
                     self.progress.emit(progress)
                     
-                    # 获取B列数据（法人姓名）
-                    if len(df.columns) < 2:
-                        self.log_message.emit(f"第{index+2}行: Excel列数不足，跳过")
-                        self.results['skipped'] += 1
+                    # 获取法人姓名
+                    legal_name_col = self.column_mapping.get('legal_name')
+                    if legal_name_col is None or legal_name_col < 0:
+                        self.log_message.emit(f"第{index+2}行: 未配置法人姓名列，跳过")
+                        self.results['skipped_empty'] += 1
                         continue
                     
-                    legal_name = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ""
+                    legal_name = self.get_cell_value(row, legal_name_col)
                     if not legal_name:
-                        self.log_message.emit(f"第{index+2}行: B列法人姓名为空，跳过")
-                        self.results['skipped'] += 1
+                        self.log_message.emit(f"第{index+2}行: 法人姓名为空，跳过")
+                        self.results['skipped_empty'] += 1
                         continue
                     
-                    # 检查是否已存在相同的法人姓名
-                    cursor.execute("SELECT id FROM ba_rlb_customer WHERE legal_name = %s", (legal_name,))
-                    existing = cursor.fetchone()
+                    # 检查是否已存在
+                    if self.check_field:
+                        cursor.execute(f"SELECT id FROM ba_rlb_customer WHERE {self.check_field} = %s", (legal_name,))
+                        existing = cursor.fetchone()
+                        
+                        if existing:
+                            self.log_message.emit(f"第{index+2}行: '{legal_name}' 已存在（ID={existing[0]}），跳过")
+                            self.results['skipped_exists'] += 1
+                            continue
                     
-                    if existing:
-                        self.log_message.emit(f"第{index+2}行: 法人姓名 '{legal_name}' 已存在，跳过")
-                        self.results['skipped'] += 1
-                        continue
-                    
-                    # 获取G列数据（客户类型）
-                    is_customer = 1  # 默认为1
-                    if len(df.columns) >= 7:
-                        g_value = str(row.iloc[6]).strip() if pd.notna(row.iloc[6]) else ""
-                        if g_value == "企业法人":
+                    # 获取客户类型
+                    is_customer = 1
+                    customer_type_col = self.column_mapping.get('customer_type')
+                    if customer_type_col is not None and customer_type_col >= 0:
+                        customer_type_value = self.get_cell_value(row, customer_type_col)
+                        if customer_type_value == "企业法人":
                             is_customer = 2
                     
-                    # 获取O列数据（担当人员）
+                    # 获取担当人员
                     rlb_staff_id = None
-                    admin_id = None
-                    admin_dept_id = None
+                    admin_id = 1
+                    admin_dept_id = 1
                     
-                    if len(df.columns) >= 15:
-                        o_value = str(row.iloc[14]).strip() if pd.notna(row.iloc[14]) else ""
-                        if o_value:
-                            # 在ba_admin表中查找匹配的用户
+                    staff_col = self.column_mapping.get('staff')
+                    if staff_col is not None and staff_col >= 0:
+                        staff_value = self.get_cell_value(row, staff_col)
+                        if staff_value:
                             cursor.execute("""
                                 SELECT id, dept_id FROM ba_admin 
                                 WHERE username = %s OR nickname = %s
-                            """, (o_value, o_value))
+                            """, (staff_value, staff_value))
                             admin_result = cursor.fetchone()
                             
                             if admin_result:
                                 admin_id = admin_result[0]
                                 rlb_staff_id = admin_result[0]
-                                admin_dept_id = admin_result[1] or 0
-                                self.log_message.emit(f"第{index+2}行: 找到担当人员 '{o_value}' (ID: {admin_id})")
+                                admin_dept_id = admin_result[1] or 1
+                                self.log_message.emit(f"第{index+2}行: 找到担当人员 '{staff_value}' (ID: {admin_id})")
                             else:
-                                self.log_message.emit(f"第{index+2}行: 未找到担当人员 '{o_value}'")
-                                admin_id = 1  # 默认管理员ID
-                                admin_dept_id = 1  # 默认部门ID
-                    else:
-                        admin_id = 1  # 默认管理员ID
-                        admin_dept_id = 1  # 默认部门ID
+                                self.log_message.emit(f"第{index+2}行: 未找到担当人员 '{staff_value}'，使用默认值")
                     
                     # 插入数据
                     current_time = int(datetime.now().timestamp())
@@ -154,7 +152,7 @@ class ExcelToDbWorker(QThread):
                         rlb_staff_id,
                         admin_id,
                         admin_dept_id,
-                        "系统导入",  # 添加备注字段
+                        "系统导入",
                         current_time,
                         current_time
                     ))
@@ -168,7 +166,6 @@ class ExcelToDbWorker(QThread):
                     self.log_message.emit(error_msg)
                     self.results['logs'].append(error_msg)
             
-            # 提交事务
             connection.commit()
             cursor.close()
             connection.close()
@@ -178,6 +175,15 @@ class ExcelToDbWorker(QThread):
             
         except Exception as e:
             self.error.emit(str(e))
+    
+    def get_cell_value(self, row, col_index):
+        """获取单元格值"""
+        if col_index is None or col_index < 0 or col_index >= len(row):
+            return None
+        value = row.iloc[col_index]
+        if pd.isna(value) or str(value).strip() == '' or str(value).strip().lower() == 'nan':
+            return None
+        return str(value).strip()
 
 
 class ExcelToDbWidget(QWidget):
@@ -228,32 +234,64 @@ class ExcelToDbWidget(QWidget):
         file_group.setLayout(file_layout)
         layout.addWidget(file_group)
         
+        # 列映射配置区域
+        mapping_group = QGroupBox("列映射配置（选择Excel文件后可配置）")
+        mapping_layout = QFormLayout()
+        
+        # 法人姓名列（必选）
+        self.legal_name_col_combo = QComboBox()
+        self.legal_name_col_combo.setEnabled(False)
+        self.legal_name_col_combo.currentIndexChanged.connect(self.update_import_button_state)
+        mapping_layout.addRow("法人姓名列 (必选，对应legal_name):", self.legal_name_col_combo)
+        
+        # 客户类型列（可选）
+        self.customer_type_col_combo = QComboBox()
+        self.customer_type_col_combo.setEnabled(False)
+        mapping_layout.addRow("客户类型列 (可选，'企业法人'则is_customer=2):", self.customer_type_col_combo)
+        
+        # 担当人员列（可选）
+        self.staff_col_combo = QComboBox()
+        self.staff_col_combo.setEnabled(False)
+        mapping_layout.addRow("担当人员列 (可选，匹配ba_admin表):", self.staff_col_combo)
+        
+        # 查重字段选择
+        self.check_field_combo = QComboBox()
+        self.check_field_combo.addItem("legal_name (法人姓名)", "legal_name")
+        self.check_field_combo.addItem("不检查重复", "")
+        mapping_layout.addRow("导入前检查重复字段:", self.check_field_combo)
+        
+        mapping_group.setLayout(mapping_layout)
+        layout.addWidget(mapping_group)
+        
         # 数据预览区域
-        self.preview_group = QGroupBox("数据预览和列映射说明")
-        self.preview_group.setEnabled(False)
+        preview_group = QGroupBox("数据预览（前5行）")
         preview_layout = QVBoxLayout()
         
-        # 说明文字
-        info_label = QLabel("""
-<b>列映射说明:</b><br>
-• <b>B列</b>: 法人姓名 → legal_name<br>
-• <b>G列</b>: 客户类型 (如果是"企业法人"则is_customer=2，其他为1)<br>
-• <b>O列</b>: 担当人员 → 在ba_admin表中匹配username或nickname<br><br>
-<b>处理逻辑:</b><br>
-• 如果legal_name已存在，则跳过该行<br>
-• 自动填充create_time和update_time<br>
-• remark字段自动填充为"系统导入"<br>
-• 未找到担当人员时使用默认值
-        """)
-        info_label.setWordWrap(True)
-        preview_layout.addWidget(info_label)
-        
         self.preview_table = QTableWidget()
-        self.preview_table.setMaximumHeight(200)
+        self.preview_table.setMaximumHeight(150)
         preview_layout.addWidget(self.preview_table)
         
-        self.preview_group.setLayout(preview_layout)
-        layout.addWidget(self.preview_group)
+        preview_group.setLayout(preview_layout)
+        layout.addWidget(preview_group)
+        
+        # 功能说明区域
+        info_group = QGroupBox("功能说明")
+        info_layout = QVBoxLayout()
+        
+        info_label = QLabel("""
+<b>Excel导入客户表说明:</b><br>
+• 目标表: ba_rlb_customer<br>
+• 法人姓名列: 必选，对应 legal_name 字段<br>
+• 客户类型列: 可选，如果值是"企业法人"则 is_customer=2，否则为1<br>
+• 担当人员列: 可选，在 ba_admin 表中匹配 username 或 nickname<br>
+• 导入前检查: 根据选择的字段检查是否已存在，存在则跳过<br>
+• 自动填充: create_time, update_time, remark="系统导入"
+        """)
+        info_label.setWordWrap(True)
+        info_layout.addWidget(info_label)
+        
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
         
         # 操作按钮区域
         button_layout = QHBoxLayout()
@@ -265,7 +303,6 @@ class ExcelToDbWidget(QWidget):
         
         button_layout.addStretch()
         
-        # 进度条
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         button_layout.addWidget(self.progress_bar)
@@ -277,7 +314,7 @@ class ExcelToDbWidget(QWidget):
         log_layout = QVBoxLayout()
         
         self.log_text = QTextEdit()
-        self.log_text.setMaximumHeight(200)
+        self.log_text.setMaximumHeight(150)
         self.log_text.setReadOnly(True)
         log_layout.addWidget(self.log_text)
         
@@ -352,7 +389,6 @@ class ExcelToDbWidget(QWidget):
     def load_excel_preview(self):
         """加载Excel文件预览"""
         try:
-            # 读取Excel文件
             if self.input_file.endswith('.xlsx'):
                 try:
                     self.df = pd.read_excel(self.input_file, engine='openpyxl', header=0)
@@ -371,14 +407,62 @@ class ExcelToDbWidget(QWidget):
             else:
                 self.df = pd.read_excel(self.input_file, engine='xlrd', header=0)
             
-            # 启用预览组件
-            self.preview_group.setEnabled(True)
+            # 填充列选择下拉框
+            self.populate_column_combos()
             
-            # 显示数据预览（前5行）
+            # 显示数据预览
             self.show_data_preview()
             
         except Exception as e:
             QMessageBox.critical(self, "错误", f"读取Excel文件失败：{str(e)}")
+    
+    def populate_column_combos(self):
+        """填充列选择下拉框"""
+        if self.df is None:
+            return
+        
+        columns = self.df.columns.tolist()
+        
+        col_options = []
+        for i, col in enumerate(columns):
+            col_letter = chr(65 + i) if i < 26 else f"A{chr(65 + i - 26)}" if i < 52 else f"Col{i+1}"
+            col_options.append((f"{col_letter}列: {col}", i))
+        
+        # 法人姓名列（必选）
+        self.legal_name_col_combo.clear()
+        self.legal_name_col_combo.addItem("请选择列", -1)
+        for text, idx in col_options:
+            self.legal_name_col_combo.addItem(text, idx)
+        self.legal_name_col_combo.setEnabled(True)
+        
+        # 客户类型列（可选）
+        self.customer_type_col_combo.clear()
+        self.customer_type_col_combo.addItem("不使用", -1)
+        for text, idx in col_options:
+            self.customer_type_col_combo.addItem(text, idx)
+        self.customer_type_col_combo.setEnabled(True)
+        
+        # 担当人员列（可选）
+        self.staff_col_combo.clear()
+        self.staff_col_combo.addItem("不使用", -1)
+        for text, idx in col_options:
+            self.staff_col_combo.addItem(text, idx)
+        self.staff_col_combo.setEnabled(True)
+        
+        # 尝试自动匹配
+        self.auto_match_columns(columns)
+    
+    def auto_match_columns(self, columns):
+        """尝试自动匹配常见列名"""
+        for i, col in enumerate(columns):
+            col_lower = str(col).lower()
+            
+            if '法人' in col_lower or 'legal' in col_lower:
+                self.legal_name_col_combo.setCurrentIndex(i + 1)
+            elif '类型' in col_lower or '属性' in col_lower:
+                self.customer_type_col_combo.setCurrentIndex(i + 1)
+            elif '担当' in col_lower or '负责' in col_lower or '人员' in col_lower:
+                self.staff_col_combo.setCurrentIndex(i + 1)
     
     def show_data_preview(self):
         """显示数据预览"""
@@ -390,17 +474,28 @@ class ExcelToDbWidget(QWidget):
         
         for i in range(len(preview_df)):
             for j, col in enumerate(preview_df.columns):
-                item = QTableWidgetItem(str(preview_df.iloc[i, j]))
+                value = preview_df.iloc[i, j]
+                item = QTableWidgetItem(str(value) if pd.notna(value) else "")
                 self.preview_table.setItem(i, j, item)
         
-        # 自适应列宽
         self.preview_table.resizeColumnsToContents()
     
     def update_import_button_state(self):
         """更新导入按钮状态"""
         has_datasource = self.datasource_combo.currentData() is not None
         has_file = bool(self.input_file)
-        self.import_btn.setEnabled(has_datasource and has_file)
+        legal_name_selected = (self.legal_name_col_combo.currentData() is not None and 
+                               self.legal_name_col_combo.currentData() >= 0)
+        
+        self.import_btn.setEnabled(has_datasource and has_file and legal_name_selected)
+    
+    def get_column_mapping(self):
+        """获取列映射配置"""
+        return {
+            'legal_name': self.legal_name_col_combo.currentData(),
+            'customer_type': self.customer_type_col_combo.currentData() if self.customer_type_col_combo.currentData() >= 0 else None,
+            'staff': self.staff_col_combo.currentData() if self.staff_col_combo.currentData() >= 0 else None
+        }
     
     def start_import(self):
         """开始导入"""
@@ -409,12 +504,24 @@ class ExcelToDbWidget(QWidget):
             QMessageBox.warning(self, "警告", "请选择数据源和Excel文件！")
             return
         
-        # 确认对话框
+        column_mapping = self.get_column_mapping()
+        check_field = self.check_field_combo.currentData()
+        
+        # 构建映射说明
+        mapping_info = []
+        mapping_info.append(f"法人姓名: {self.legal_name_col_combo.currentText()}")
+        mapping_info.append(f"客户类型: {self.customer_type_col_combo.currentText()}")
+        mapping_info.append(f"担当人员: {self.staff_col_combo.currentText()}")
+        mapping_info.append(f"重复检查: {self.check_field_combo.currentText()}")
+        
         reply = QMessageBox.question(
             self,
             "确认导入",
-            f"确定要将Excel数据导入到数据库 '{datasource.name}' 吗？\n\n"
-            f"数据将插入到 ba_rlb_customer 表中。",
+            f"确定要将Excel数据导入到数据库吗？\n\n"
+            f"数据库: {datasource.name}\n"
+            f"目标表: ba_rlb_customer\n\n"
+            f"列映射配置:\n" + "\n".join(mapping_info) + "\n\n"
+            f"已存在的记录将被跳过。",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
@@ -422,15 +529,13 @@ class ExcelToDbWidget(QWidget):
         if reply != QMessageBox.Yes:
             return
         
-        # 禁用按钮，显示进度条
         self.import_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.result_label.setText("正在导入中...")
         self.log_text.clear()
         
-        # 启动工作线程
-        self.worker = ExcelToDbWorker(self.input_file, datasource, self.db_manager)
+        self.worker = ExcelToDbWorker(self.input_file, datasource, self.db_manager, column_mapping, check_field)
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log_message.connect(self.append_log)
         self.worker.finished.connect(self.on_import_finished)
@@ -451,7 +556,8 @@ class ExcelToDbWidget(QWidget):
             f"导入完成！\n"
             f"总计：{results['total']} 行\n"
             f"成功：{results['success']} 行\n"
-            f"跳过：{results['skipped']} 行\n"
+            f"跳过(空值)：{results['skipped_empty']} 行\n"
+            f"跳过(已存在)：{results['skipped_exists']} 行\n"
             f"失败：{results['failed']} 行"
         )
         

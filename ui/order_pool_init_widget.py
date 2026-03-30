@@ -347,6 +347,7 @@ class OrderPoolInitWidget(QWidget):
         # 平台名称列
         self.platform_col_combo = QComboBox()
         self.platform_col_combo.setEnabled(False)
+        self.platform_col_combo.currentIndexChanged.connect(self.update_start_button_state)
         mapping_layout.addRow("平台名称列 (用于查找ba_platform):", self.platform_col_combo)
         
         # 企业国别列
@@ -357,11 +358,13 @@ class OrderPoolInitWidget(QWidget):
         # 属性列
         self.attribute_col_combo = QComboBox()
         self.attribute_col_combo.setEnabled(False)
+        self.attribute_col_combo.currentIndexChanged.connect(self.update_start_button_state)
         mapping_layout.addRow("属性列 (个人/个人事业主/企业法人):", self.attribute_col_combo)
         
         # 属地简称列
         self.territory_col_combo = QComboBox()
         self.territory_col_combo.setEnabled(False)
+        self.territory_col_combo.currentIndexChanged.connect(self.update_start_button_state)
         mapping_layout.addRow("属地简称列 (用于查找ba_shudi):", self.territory_col_combo)
         
         mapping_group.setLayout(mapping_layout)

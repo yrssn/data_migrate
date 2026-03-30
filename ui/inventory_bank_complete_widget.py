@@ -5,7 +5,8 @@ import os
 from datetime import datetime
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
                              QPushButton, QLabel, QMessageBox, QComboBox,
-                             QGroupBox, QProgressBar, QTextEdit, QFileDialog)
+                             QGroupBox, QProgressBar, QTextEdit, QFileDialog,
+                             QTableWidget, QTableWidgetItem)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
 from database import DatabaseManager
@@ -17,19 +18,20 @@ class InventoryBankCompleteWorker(QThread):
     """库存银行卡信息补全工作线程"""
     progress = pyqtSignal(int)
     log_message = pyqtSignal(str)
-    finished = pyqtSignal(dict)  # 返回统计结果和补全后的数据
+    finished = pyqtSignal(dict)
     error = pyqtSignal(str)
     
-    def __init__(self, source_datasource, db_manager, excel_file):
+    def __init__(self, source_datasource, db_manager, excel_file, column_mapping):
         super().__init__()
         self.source_datasource = source_datasource
         self.db_manager = db_manager
         self.excel_file = excel_file
+        self.column_mapping = column_mapping
         self.results = {
             'total_rows': 0,
             'success_count': 0,
             'failed_count': 0,
-            'completed_data': [],  # 补全后的数据
+            'completed_data': [],
             'failed_records': []
         }
     
@@ -38,7 +40,6 @@ class InventoryBankCompleteWorker(QThread):
             self.log_message.emit("开始读取Excel文件...")
             self.progress.emit(5)
             
-            # 读取Excel文件
             try:
                 df = pd.read_excel(self.excel_file, engine='openpyxl')
                 self.log_message.emit(f"成功读取Excel文件，共 {len(df)} 行数据")
@@ -49,7 +50,6 @@ class InventoryBankCompleteWorker(QThread):
             self.results['total_rows'] = len(df)
             self.progress.emit(10)
             
-            # 连接源数据库
             self.log_message.emit("开始连接源数据库...")
             source_connection = pymysql.connect(
                 host=self.source_datasource.host,
@@ -63,14 +63,12 @@ class InventoryBankCompleteWorker(QThread):
             self.log_message.emit("源数据库连接成功")
             self.progress.emit(15)
             
-            # 处理每一行数据
             for index, row in df.iterrows():
                 try:
                     completed_row = self.process_row(source_cursor, index + 1, row)
                     self.results['completed_data'].append(completed_row)
                     self.results['success_count'] += 1
                     
-                    # 更新进度
                     progress = 15 + int((index + 1) / len(df) * 80)
                     self.progress.emit(progress)
                     
@@ -79,7 +77,6 @@ class InventoryBankCompleteWorker(QThread):
                     error_msg = f"第{index + 1}行处理失败: {str(e)}"
                     self.log_message.emit(error_msg)
                     
-                    # 记录失败的行，保留原始数据
                     failed_row = row.to_dict()
                     failed_row['处理状态'] = '失败'
                     failed_row['失败原因'] = str(e)
@@ -104,17 +101,31 @@ class InventoryBankCompleteWorker(QThread):
         except Exception as e:
             self.error.emit(str(e))
     
+    def get_cell_value(self, row, col_index):
+        """获取单元格值"""
+        if col_index is None or col_index < 0 or col_index >= len(row):
+            return None
+        value = row.iloc[col_index]
+        if pd.isna(value) or str(value).strip() == '' or str(value).strip().lower() == 'nan':
+            return None
+        return str(value).strip()
+    
     def process_row(self, source_cursor, row_num, row):
         """处理单行数据"""
         try:
-            # 获取Excel列数据
-            legal_name = str(row.iloc[1]) if len(row) > 1 else ""  # B列：法人姓名
-            site_type_name = str(row.iloc[3]) if len(row) > 3 else ""  # D列：店铺类型名称
+            # 获取法人姓名
+            legal_name_col = self.column_mapping.get('legal_name')
+            legal_name = self.get_cell_value(row, legal_name_col)
             
-            if not legal_name or legal_name == 'nan':
-                raise Exception("B列(法人姓名)为空")
-            if not site_type_name or site_type_name == 'nan':
-                raise Exception("D列(店铺类型名称)为空")
+            if not legal_name:
+                raise Exception("法人姓名为空")
+            
+            # 获取店铺类型名称
+            site_type_col = self.column_mapping.get('site_type')
+            site_type_name = self.get_cell_value(row, site_type_col)
+            
+            if not site_type_name:
+                raise Exception("店铺类型名称为空")
             
             self.log_message.emit(f"第{row_num}行: 处理法人={legal_name}, 店铺类型={site_type_name}")
             
@@ -183,7 +194,6 @@ class InventoryBankCompleteWorker(QThread):
     def get_bank_card_info(self, source_cursor, card_id, row_num):
         """获取银行卡详细信息"""
         try:
-            # 查询银行卡信息，关联银行名称和货币信息
             source_cursor.execute("""
                 SELECT 
                     lc.account,
@@ -207,7 +217,6 @@ class InventoryBankCompleteWorker(QThread):
             (account, balance, bank_card_type, bank_name, bank_type, 
              currency_code, currency_name) = card_result
             
-            # 转换银行卡类型显示
             card_type_display = ''
             if bank_card_type == 1:
                 card_type_display = '个人卡'
@@ -218,7 +227,6 @@ class InventoryBankCompleteWorker(QThread):
             else:
                 card_type_display = f'未知类型({bank_card_type})'
             
-            # 转换银行类型显示
             bank_type_display = ''
             if bank_type == 0:
                 bank_type_display = '第三方'
@@ -250,6 +258,7 @@ class InventoryBankCompleteWidget(QWidget):
         super().__init__()
         self.db_manager = db_manager
         self.excel_file = None
+        self.excel_data = None
         self.completed_data = []
         self.failed_records = []
         self.init_ui()
@@ -293,30 +302,48 @@ class InventoryBankCompleteWidget(QWidget):
         file_group.setLayout(file_layout)
         layout.addWidget(file_group)
         
+        # 列映射配置区域
+        mapping_group = QGroupBox("列映射配置（选择Excel文件后可配置）")
+        mapping_layout = QFormLayout()
+        
+        # 法人姓名列（必选）
+        self.legal_name_col_combo = QComboBox()
+        self.legal_name_col_combo.setEnabled(False)
+        self.legal_name_col_combo.currentIndexChanged.connect(self.update_start_button_state)
+        mapping_layout.addRow("法人姓名列 (用于查找ea_dy_legal表):", self.legal_name_col_combo)
+        
+        # 店铺类型列（必选）
+        self.site_type_col_combo = QComboBox()
+        self.site_type_col_combo.setEnabled(False)
+        self.site_type_col_combo.currentIndexChanged.connect(self.update_start_button_state)
+        mapping_layout.addRow("店铺类型列 (用于查找ea_dy_site_type表):", self.site_type_col_combo)
+        
+        mapping_group.setLayout(mapping_layout)
+        layout.addWidget(mapping_group)
+        
+        # 数据预览区域
+        preview_group = QGroupBox("数据预览（前5行）")
+        preview_layout = QVBoxLayout()
+        
+        self.preview_table = QTableWidget()
+        self.preview_table.setMaximumHeight(120)
+        preview_layout.addWidget(self.preview_table)
+        
+        preview_group.setLayout(preview_layout)
+        layout.addWidget(preview_group)
+        
         # 功能说明区域
         info_group = QGroupBox("功能说明")
         info_layout = QVBoxLayout()
         
         info_label = QLabel("""
 <b>补全现有库存关联银行卡信息说明:</b><br>
-<b>Excel列要求:</b><br>
-• B列: 法人姓名 (用于查找ea_dy_legal表)<br>
-• D列: 店铺类型名称 (用于查找ea_dy_site_type表)<br><br>
 <b>查找逻辑:</b><br>
-• 1. 根据B列法人姓名在ea_dy_legal表中找到legal_id<br>
-• 2. 根据D列店铺类型名称在ea_dy_site_type表中找到site_type_id<br>
+• 1. 根据法人姓名在ea_dy_legal表中找到legal_id<br>
+• 2. 根据店铺类型名称在ea_dy_site_type表中找到site_type_id<br>
 • 3. 根据legal_id和siteType在ea_dy_shop表中找到对应店铺记录<br>
 • 4. 获取ea_dy_shop.card_id，查询ea_dy_legal_cards获取银行卡信息<br>
-• 5. 关联ea_dy_bankcard和ea_dy_currency获取完整银行信息<br><br>
-<b>补全字段:</b><br>
-• 店铺ID、店铺名称<br>
-• 银行卡ID、银行卡号、银行卡余额<br>
-• 银行名称、银行类型 (个人/企业/未知)<br>
-• 货币代码、银行卡类型 (个人卡/企业卡/第三方卡)<br>
-• 处理状态、失败原因<br><br>
-<b>导出结果:</b><br>
-• 原Excel数据 + 补全的银行卡信息<br>
-• 支持导出处理失败的记录进行分析
+<b>补全字段:</b> 店铺ID、店铺名称、银行卡ID、银行卡号、银行卡余额、银行名称、银行类型、货币代码
         """)
         info_label.setWordWrap(True)
         info_layout.addWidget(info_label)
@@ -344,7 +371,6 @@ class InventoryBankCompleteWidget(QWidget):
         
         button_layout.addStretch()
         
-        # 进度条
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         button_layout.addWidget(self.progress_bar)
@@ -356,7 +382,7 @@ class InventoryBankCompleteWidget(QWidget):
         log_layout = QVBoxLayout()
         
         self.log_text = QTextEdit()
-        self.log_text.setMaximumHeight(200)
+        self.log_text.setMaximumHeight(150)
         self.log_text.setReadOnly(True)
         log_layout.addWidget(self.log_text)
         
@@ -422,13 +448,99 @@ class InventoryBankCompleteWidget(QWidget):
             self.excel_file = file_path
             self.file_label.setText(os.path.basename(file_path))
             self.file_label.setStyleSheet("color: green;")
-            self.update_start_button_state()
+            
+            try:
+                self.excel_data = pd.read_excel(file_path, engine='openpyxl')
+                self.populate_column_combos()
+                self.show_preview()
+                self.update_start_button_state()
+                
+            except Exception as e:
+                QMessageBox.critical(self, "文件读取失败", f"读取Excel文件失败：{str(e)}")
+                self.excel_file = None
+                self.excel_data = None
+                self.file_label.setText("未选择文件")
+                self.file_label.setStyleSheet("color: gray;")
+    
+    def populate_column_combos(self):
+        """填充列选择下拉框"""
+        if self.excel_data is None:
+            return
+        
+        columns = self.excel_data.columns.tolist()
+        
+        col_options = []
+        for i, col in enumerate(columns):
+            col_letter = chr(65 + i) if i < 26 else f"A{chr(65 + i - 26)}" if i < 52 else f"Col{i+1}"
+            col_options.append((f"{col_letter}列: {col}", i))
+        
+        # 法人姓名列
+        self.legal_name_col_combo.clear()
+        self.legal_name_col_combo.addItem("请选择列", -1)
+        for text, idx in col_options:
+            self.legal_name_col_combo.addItem(text, idx)
+        self.legal_name_col_combo.setEnabled(True)
+        
+        # 店铺类型列
+        self.site_type_col_combo.clear()
+        self.site_type_col_combo.addItem("请选择列", -1)
+        for text, idx in col_options:
+            self.site_type_col_combo.addItem(text, idx)
+        self.site_type_col_combo.setEnabled(True)
+        
+        # 尝试自动匹配
+        self.auto_match_columns(columns)
+    
+    def auto_match_columns(self, columns):
+        """尝试自动匹配常见列名"""
+        for i, col in enumerate(columns):
+            col_lower = str(col).lower()
+            
+            if '法人' in col_lower and ('姓名' in col_lower or '名' in col_lower):
+                self.legal_name_col_combo.setCurrentIndex(i + 1)
+            elif '店铺' in col_lower and '类型' in col_lower:
+                self.site_type_col_combo.setCurrentIndex(i + 1)
+            elif '类型' in col_lower and '店铺' not in col_lower:
+                if self.site_type_col_combo.currentData() == -1:
+                    self.site_type_col_combo.setCurrentIndex(i + 1)
+    
+    def show_preview(self):
+        """显示数据预览"""
+        if self.excel_data is None:
+            return
+        
+        preview_df = self.excel_data.head(5)
+        
+        self.preview_table.setRowCount(len(preview_df))
+        self.preview_table.setColumnCount(len(preview_df.columns))
+        self.preview_table.setHorizontalHeaderLabels([str(col) for col in preview_df.columns])
+        
+        for i in range(len(preview_df)):
+            for j, col in enumerate(preview_df.columns):
+                value = preview_df.iloc[i, j]
+                item = QTableWidgetItem(str(value) if pd.notna(value) else "")
+                self.preview_table.setItem(i, j, item)
+        
+        self.preview_table.resizeColumnsToContents()
     
     def update_start_button_state(self):
         """更新开始按钮状态"""
         datasource_selected = self.source_datasource_combo.currentData() is not None
         file_selected = self.excel_file is not None
-        self.start_btn.setEnabled(datasource_selected and file_selected)
+        legal_name_selected = (self.legal_name_col_combo.currentData() is not None and 
+                               self.legal_name_col_combo.currentData() >= 0)
+        site_type_selected = (self.site_type_col_combo.currentData() is not None and 
+                              self.site_type_col_combo.currentData() >= 0)
+        
+        self.start_btn.setEnabled(datasource_selected and file_selected and 
+                                  legal_name_selected and site_type_selected)
+    
+    def get_column_mapping(self):
+        """获取列映射配置"""
+        return {
+            'legal_name': self.legal_name_col_combo.currentData(),
+            'site_type': self.site_type_col_combo.currentData()
+        }
     
     def start_complete(self):
         """开始补全"""
@@ -437,13 +549,19 @@ class InventoryBankCompleteWidget(QWidget):
             QMessageBox.warning(self, "警告", "请选择源数据源和Excel文件！")
             return
         
-        # 确认对话框
+        column_mapping = self.get_column_mapping()
+        
+        mapping_info = []
+        mapping_info.append(f"法人姓名: {self.legal_name_col_combo.currentText()}")
+        mapping_info.append(f"店铺类型: {self.site_type_col_combo.currentText()}")
+        
         reply = QMessageBox.question(
             self,
             "确认补全",
             f"确定要补全库存银行卡信息吗？\n\n"
             f"源数据库: {source_datasource.name}\n"
             f"Excel文件: {os.path.basename(self.excel_file)}\n\n"
+            f"列映射配置:\n" + "\n".join(mapping_info) + "\n\n"
             f"此操作将根据Excel中的法人姓名和店铺类型\n"
             f"从源数据库中查找对应的银行卡信息进行补全。",
             QMessageBox.Yes | QMessageBox.No,
@@ -453,7 +571,6 @@ class InventoryBankCompleteWidget(QWidget):
         if reply != QMessageBox.Yes:
             return
         
-        # 禁用按钮，显示进度条
         self.start_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
@@ -462,8 +579,8 @@ class InventoryBankCompleteWidget(QWidget):
         self.completed_data = []
         self.failed_records = []
         
-        # 启动工作线程
-        self.worker = InventoryBankCompleteWorker(source_datasource, self.db_manager, self.excel_file)
+        self.worker = InventoryBankCompleteWorker(source_datasource, self.db_manager, 
+                                                   self.excel_file, column_mapping)
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log_message.connect(self.append_log)
         self.worker.finished.connect(self.on_complete_finished)
@@ -524,7 +641,6 @@ class InventoryBankCompleteWidget(QWidget):
         
         if file_path:
             try:
-                # 创建DataFrame并导出
                 df = pd.DataFrame(self.completed_data)
                 df.to_excel(file_path, index=False, engine='openpyxl')
                 
@@ -548,7 +664,6 @@ class InventoryBankCompleteWidget(QWidget):
         
         if file_path:
             try:
-                # 准备导出数据
                 export_data = []
                 for record in self.failed_records:
                     row_data = record['data'].copy()
@@ -556,7 +671,6 @@ class InventoryBankCompleteWidget(QWidget):
                     row_data['错误原因'] = record['error']
                     export_data.append(row_data)
                 
-                # 创建DataFrame并导出
                 df = pd.DataFrame(export_data)
                 df.to_excel(file_path, index=False, engine='openpyxl')
                 
