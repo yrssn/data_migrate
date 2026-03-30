@@ -37,6 +37,7 @@ from .legal_change_fix_widget import LegalChangeFixWidget
 from .status_change_widget import StatusChangeWidget
 from .platform_info_preprocess_widget import PlatformInfoPreprocessWidget
 from .extract_by_column_widget import ExtractByColumnWidget
+from .platform_exist_precheck_widget import PlatformExistPrecheckWidget
 
 
 class MainWindow(QMainWindow):
@@ -383,6 +384,7 @@ class MainWindow(QMainWindow):
         self.function_combo2.addItem("改变状态栏", "status_change")
         self.function_combo2.addItem("平台注册部平台详情预先处理", "platform_info_preprocess")
         self.function_combo2.addItem("去除平台重复数据", "extract_by_column")
+        self.function_combo2.addItem("平台存在预检测", "platform_exist_precheck")
         self.function_combo2.currentTextChanged.connect(self.on_function_changed2)
         function_layout.addWidget(self.function_combo2)
 
@@ -404,6 +406,9 @@ class MainWindow(QMainWindow):
         # 去除平台重复数据功能
         self.extract_by_column_widget = ExtractByColumnWidget(self.db_manager)
         self.function_stack2.addWidget(self.extract_by_column_widget)
+
+        self.platform_exist_precheck_widget = PlatformExistPrecheckWidget(self.db_manager)
+        self.function_stack2.addWidget(self.platform_exist_precheck_widget)
 
         # 占位页面（其他功能）
         placeholder_widget = QWidget()
@@ -428,8 +433,10 @@ class MainWindow(QMainWindow):
             self.function_stack2.setCurrentIndex(1)
         elif "去除平台重复数据" in text:
             self.function_stack2.setCurrentIndex(2)
-        else:
+        elif "平台存在预检测" in text:
             self.function_stack2.setCurrentIndex(3)
+        else:
+            self.function_stack2.setCurrentIndex(4)
     
     def load_datasources(self):
         """加载数据源列表"""
