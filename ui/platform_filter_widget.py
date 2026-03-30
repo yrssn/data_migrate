@@ -354,6 +354,7 @@ class PlatformFilterWidget(QWidget):
                 
                 # 填充平台列下拉框
                 self.platform_column_combo.clear()
+                self.platform_column_combo.addItem("请选择列")
                 self.platform_column_combo.addItems(self.excel_columns)
                 self.platform_column_combo.setEnabled(True)
                 

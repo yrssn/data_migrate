@@ -113,6 +113,10 @@ class PlatformExistPrecheckWidget(QWidget):
         table_group = QGroupBox("唯一平台值检测结果（按 Excel 列去重）")
         table_layout = QVBoxLayout()
         self.result_table = QTableWidget()
+        self.result_table.setColumnCount(4)
+        self.result_table.setHorizontalHeaderLabels(
+            ["平台值(列内代表)", "是否存在", "出现次数", "说明"]
+        )
         self.result_table.setAlternatingRowColors(True)
         header = self.result_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
@@ -220,8 +224,7 @@ class PlatformExistPrecheckWidget(QWidget):
             cur.execute(
                 """
                 SELECT platform FROM ba_platform
-                WHERE status = 1
-                  AND (delete_time IS NULL OR delete_time = 0)
+                WHERE (delete_time IS NULL OR delete_time = 0)
                 """
             )
             rows = cur.fetchall()

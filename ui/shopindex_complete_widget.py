@@ -57,6 +57,9 @@ class ShopIndexCompleteWorker(QThread):
             self.log_message.emit("数据库连接成功")
             self.progress.emit(10)
             
+            # 初始化编号计数器（只查询一次）
+            self.init_counters(cursor)
+            
             current_time = int(datetime.now().timestamp())
             
             # 处理ba_rlb_customer表
@@ -88,26 +91,33 @@ class ShopIndexCompleteWorker(QThread):
         except Exception as e:
             self.error.emit(str(e))
     
-    def get_next_shopindex_id(self, cursor, prefix):
-        """获取下一个编号"""
-        cursor.execute("""
-            SELECT shopindex_id FROM ba_shopindex 
-            WHERE shopindex_id LIKE %s 
-            ORDER BY shopindex_id DESC LIMIT 1
-        """, (f"{prefix}%",))
+    def init_counters(self, cursor):
+        """初始化编号计数器，只查询一次数据库"""
+        self.counters = {}
+        for prefix in ['P', 'S', 'C']:
+            cursor.execute("""
+                SELECT shopindex_id FROM ba_shopindex 
+                WHERE shopindex_id LIKE %s 
+                ORDER BY shopindex_id DESC LIMIT 1
+            """, (f"{prefix}%",))
+            
+            result = cursor.fetchone()
+            if result:
+                current_id = result[0]
+                match = re.search(r'(\d+)$', current_id)
+                if match:
+                    self.counters[prefix] = int(match.group(1))
+                else:
+                    self.counters[prefix] = 0
+            else:
+                self.counters[prefix] = 0
         
-        result = cursor.fetchone()
-        if result:
-            # 提取数字部分
-            current_id = result[0]
-            match = re.search(r'(\d+)$', current_id)
-            if match:
-                current_num = int(match.group(1))
-                next_num = current_num + 1
-                return f"{prefix}{next_num:05d}"
-        
-        # 如果没有找到，从00001开始
-        return f"{prefix}00001"
+        self.log_message.emit(f"当前最大编号: P{self.counters['P']:05d}, S{self.counters['S']:05d}, C{self.counters['C']:05d}")
+    
+    def get_next_shopindex_id(self, prefix):
+        """获取下一个编号（使用内存计数器，不查数据库）"""
+        self.counters[prefix] += 1
+        return f"{prefix}{self.counters[prefix]:05d}"
     
     def process_customer_table(self, cursor, current_time):
         """处理ba_rlb_customer表"""
@@ -119,10 +129,15 @@ class ShopIndexCompleteWorker(QThread):
         """)
         customers = cursor.fetchall()
         
-        self.log_message.emit(f"找到 {len(customers)} 个客户记录")
+        total = len(customers)
+        self.log_message.emit(f"找到 {total} 个客户记录，开始处理...")
         
-        for customer in customers:
+        for idx, customer in enumerate(customers):
             customer_id, admin_id, admin_dept_id = customer
+            
+            # 每处理50条输出一次进度
+            if (idx + 1) % 50 == 0:
+                self.log_message.emit(f"客户表处理进度: {idx + 1}/{total}")
             
             try:
                 # 确保参数不为None
@@ -139,7 +154,7 @@ class ShopIndexCompleteWorker(QThread):
                 
                 if not cursor.fetchone():
                     # 获取下一个P编号
-                    p_shopindex_id = self.get_next_shopindex_id(cursor, "P")
+                    p_shopindex_id = self.get_next_shopindex_id("P")
                     
                     # 插入P记录
                     cursor.execute("""
@@ -149,7 +164,6 @@ class ShopIndexCompleteWorker(QThread):
                     """, (p_shopindex_id, 'opt0', admin_id, current_time, current_time, '脚本补全', 1, customer_id, admin_dept_id, customer_id))
                     
                     self.results['customer_p_added'] += 1
-                    self.log_message.emit(f"为客户ID {customer_id} 添加P编号: {p_shopindex_id}")
                 else:
                     self.results['customer_p_skipped'] += 1
                 
@@ -161,7 +175,7 @@ class ShopIndexCompleteWorker(QThread):
                 
                 if not cursor.fetchone():
                     # 获取下一个S编号
-                    s_shopindex_id = self.get_next_shopindex_id(cursor, "S")
+                    s_shopindex_id = self.get_next_shopindex_id("S")
                     
                     # 插入S记录
                     cursor.execute("""
@@ -171,13 +185,14 @@ class ShopIndexCompleteWorker(QThread):
                     """, (s_shopindex_id, 'opt1', admin_id, current_time, current_time, '脚本补全', 1, customer_id, admin_dept_id, customer_id))
                     
                     self.results['customer_s_added'] += 1
-                    self.log_message.emit(f"为客户ID {customer_id} 添加S编号: {s_shopindex_id}")
                 else:
                     self.results['customer_s_skipped'] += 1
                     
             except Exception as e:
                 self.results['failed'] += 1
                 self.log_message.emit(f"处理客户ID {customer_id} 时出错: {str(e)}")
+        
+        self.log_message.emit(f"客户表处理完成: P新增{self.results['customer_p_added']}个, S新增{self.results['customer_s_added']}个")
     
     def process_legal_information_table(self, cursor, current_time):
         """处理ba_rlb_legal_information表"""
@@ -189,10 +204,15 @@ class ShopIndexCompleteWorker(QThread):
         """)
         legal_infos = cursor.fetchall()
         
-        self.log_message.emit(f"找到 {len(legal_infos)} 个法人信息记录")
+        total = len(legal_infos)
+        self.log_message.emit(f"找到 {total} 个法人信息记录，开始处理...")
         
-        for legal_info in legal_infos:
+        for idx, legal_info in enumerate(legal_infos):
             legal_info_id, country, admin_id = legal_info
+            
+            # 每处理50条输出一次进度
+            if (idx + 1) % 50 == 0:
+                self.log_message.emit(f"法人信息表处理进度: {idx + 1}/{total}")
             
             try:
                 # 确保参数不为None
@@ -209,7 +229,7 @@ class ShopIndexCompleteWorker(QThread):
                 
                 if not cursor.fetchone():
                     # 获取下一个C编号
-                    c_shopindex_id = self.get_next_shopindex_id(cursor, "C")
+                    c_shopindex_id = self.get_next_shopindex_id("C")
                     
                     # 获取admin_dept_id (如果有的话)
                     admin_dept_id = 1  # 默认值
@@ -222,13 +242,14 @@ class ShopIndexCompleteWorker(QThread):
                     """, (c_shopindex_id, country, 'opt2', admin_id, current_time, current_time, '脚本补全', 1, legal_info_id, 1, admin_dept_id))
                     
                     self.results['legal_info_added'] += 1
-                    self.log_message.emit(f"为法人信息ID {legal_info_id} 添加C编号: {c_shopindex_id}")
                 else:
                     self.results['legal_info_skipped'] += 1
                     
             except Exception as e:
                 self.results['failed'] += 1
                 self.log_message.emit(f"处理法人信息ID {legal_info_id} 时出错: {str(e)}")
+        
+        self.log_message.emit(f"法人信息表处理完成: 新增{self.results['legal_info_added']}个")
     
     def process_legal_information_part2_table(self, cursor, current_time):
         """处理ba_rlb_legal_information_part2表"""
@@ -240,10 +261,15 @@ class ShopIndexCompleteWorker(QThread):
         """)
         legal_part2s = cursor.fetchall()
         
-        self.log_message.emit(f"找到 {len(legal_part2s)} 个法人信息part2记录")
+        total = len(legal_part2s)
+        self.log_message.emit(f"找到 {total} 个法人信息part2记录，开始处理...")
         
-        for legal_part2 in legal_part2s:
+        for idx, legal_part2 in enumerate(legal_part2s):
             legal_part2_id, country, admin_id = legal_part2
+            
+            # 每处理50条输出一次进度
+            if (idx + 1) % 50 == 0:
+                self.log_message.emit(f"法人信息part2表处理进度: {idx + 1}/{total}")
             
             try:
                 # 确保参数不为None
@@ -260,7 +286,7 @@ class ShopIndexCompleteWorker(QThread):
                 
                 if not cursor.fetchone():
                     # 获取下一个C编号
-                    c_shopindex_id = self.get_next_shopindex_id(cursor, "C")
+                    c_shopindex_id = self.get_next_shopindex_id("C")
                     
                     # 获取admin_dept_id (如果有的话)
                     admin_dept_id = 1  # 默认值
@@ -273,13 +299,14 @@ class ShopIndexCompleteWorker(QThread):
                     """, (c_shopindex_id, country, 'opt2', admin_id, current_time, current_time, '脚本补全', 1, legal_part2_id, 2, admin_dept_id))
                     
                     self.results['legal_part2_added'] += 1
-                    self.log_message.emit(f"为法人信息part2 ID {legal_part2_id} 添加C编号: {c_shopindex_id}")
                 else:
                     self.results['legal_part2_skipped'] += 1
                     
             except Exception as e:
                 self.results['failed'] += 1
                 self.log_message.emit(f"处理法人信息part2 ID {legal_part2_id} 时出错: {str(e)}")
+        
+        self.log_message.emit(f"法人信息part2表处理完成: 新增{self.results['legal_part2_added']}个")
 
 
 class ShopIndexCompleteWidget(QWidget):

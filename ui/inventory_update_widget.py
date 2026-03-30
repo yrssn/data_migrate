@@ -479,6 +479,7 @@ class InventoryUpdateWidget(QWidget):
                 
                 # 填充ID列下拉框
                 self.id_column_combo.clear()
+                self.id_column_combo.addItem("请选择列")
                 self.id_column_combo.addItems(self.excel_columns)
                 self.id_column_combo.setEnabled(True)
                 
@@ -507,6 +508,7 @@ class InventoryUpdateWidget(QWidget):
         
         # Excel列下拉框
         excel_combo = QComboBox()
+        excel_combo.addItem("请选择列")
         excel_combo.addItems(self.excel_columns)
         excel_combo.currentTextChanged.connect(self.update_start_button_state)
         self.mapping_table.setCellWidget(row, 0, excel_combo)

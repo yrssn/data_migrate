@@ -763,7 +763,8 @@ class PtzcbRegisterWidget(QWidget):
                 self.file_label.setStyleSheet("color: green;")
                 
                 self.populate_column_combos()
-                self.auto_match_columns(self.excel_columns)
+                # 不自动匹配，让用户手动选择
+                # self.auto_match_columns(self.excel_columns)
                 self.show_data_preview()
                 
                 self.log_text.append(f"成功读取Excel文件，共 {len(df)} 行数据，{len(self.excel_columns)} 列")

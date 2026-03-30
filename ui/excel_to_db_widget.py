@@ -22,25 +22,31 @@ class ExcelToDbWorker(QThread):
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
     
-    def __init__(self, input_file, datasource, db_manager, column_mapping, check_field):
+    # import_mode: 'non_corporate' = 非企业法人(is_customer=1), 'corporate' = 企业法人(is_customer=2)
+    def __init__(self, input_file, datasource, db_manager, column_mapping, check_field, import_mode):
         super().__init__()
         self.input_file = input_file
         self.datasource = datasource
         self.db_manager = db_manager
         self.column_mapping = column_mapping
         self.check_field = check_field
+        self.import_mode = import_mode  # 'non_corporate' or 'corporate'
         self.results = {
             'total': 0,
             'success': 0,
             'skipped_empty': 0,
             'skipped_exists': 0,
+            'skipped_wrong_type': 0,
             'failed': 0,
             'logs': []
         }
     
     def run(self):
         try:
-            self.log_message.emit("开始读取Excel文件...")
+            mode_name = "非企业法人" if self.import_mode == 'non_corporate' else "企业法人"
+            is_customer_value = 1 if self.import_mode == 'non_corporate' else 2
+            
+            self.log_message.emit(f"开始读取Excel文件... (模式: {mode_name}, is_customer={is_customer_value})")
             self.progress.emit(5)
             
             if self.input_file.endswith('.xlsx'):
@@ -83,6 +89,24 @@ class ExcelToDbWorker(QThread):
                     progress = 15 + int((index / len(df)) * 80)
                     self.progress.emit(progress)
                     
+                    # 获取客户类型，根据模式筛选
+                    customer_type_col = self.column_mapping.get('customer_type')
+                    customer_type_value = None
+                    if customer_type_col is not None and customer_type_col >= 0:
+                        customer_type_value = self.get_cell_value(row, customer_type_col)
+                    
+                    # 根据导入模式筛选
+                    if self.import_mode == 'non_corporate':
+                        # 非企业法人模式：跳过企业法人
+                        if customer_type_value == "企业法人":
+                            self.results['skipped_wrong_type'] += 1
+                            continue
+                    else:
+                        # 企业法人模式：只处理企业法人
+                        if customer_type_value != "企业法人":
+                            self.results['skipped_wrong_type'] += 1
+                            continue
+                    
                     # 获取法人姓名
                     legal_name_col = self.column_mapping.get('legal_name')
                     if legal_name_col is None or legal_name_col < 0:
@@ -105,14 +129,6 @@ class ExcelToDbWorker(QThread):
                             self.log_message.emit(f"第{index+2}行: '{legal_name}' 已存在（ID={existing[0]}），跳过")
                             self.results['skipped_exists'] += 1
                             continue
-                    
-                    # 获取客户类型
-                    is_customer = 1
-                    customer_type_col = self.column_mapping.get('customer_type')
-                    if customer_type_col is not None and customer_type_col >= 0:
-                        customer_type_value = self.get_cell_value(row, customer_type_col)
-                        if customer_type_value == "企业法人":
-                            is_customer = 2
                     
                     # 获取担当人员
                     rlb_staff_id = None
@@ -137,7 +153,7 @@ class ExcelToDbWorker(QThread):
                             else:
                                 self.log_message.emit(f"第{index+2}行: 未找到担当人员 '{staff_value}'，使用默认值")
                     
-                    # 插入数据
+                    # 插入数据，使用根据模式确定的 is_customer 值
                     current_time = int(datetime.now().timestamp())
                     
                     insert_sql = """
@@ -148,7 +164,7 @@ class ExcelToDbWorker(QThread):
                     
                     cursor.execute(insert_sql, (
                         legal_name,
-                        is_customer,
+                        is_customer_value,
                         rlb_staff_id,
                         admin_id,
                         admin_dept_id,
@@ -158,7 +174,7 @@ class ExcelToDbWorker(QThread):
                     ))
                     
                     self.results['success'] += 1
-                    self.log_message.emit(f"第{index+2}行: 成功插入 '{legal_name}'")
+                    self.log_message.emit(f"第{index+2}行: 成功插入 '{legal_name}' (is_customer={is_customer_value})")
                     
                 except Exception as e:
                     self.results['failed'] += 1
@@ -244,10 +260,11 @@ class ExcelToDbWidget(QWidget):
         self.legal_name_col_combo.currentIndexChanged.connect(self.update_import_button_state)
         mapping_layout.addRow("法人姓名列 (必选，对应legal_name):", self.legal_name_col_combo)
         
-        # 客户类型列（可选）
+        # 客户类型列（必选，用于区分企业法人/非企业法人）
         self.customer_type_col_combo = QComboBox()
         self.customer_type_col_combo.setEnabled(False)
-        mapping_layout.addRow("客户类型列 (可选，'企业法人'则is_customer=2):", self.customer_type_col_combo)
+        self.customer_type_col_combo.currentIndexChanged.connect(self.update_import_button_state)
+        mapping_layout.addRow("客户类型列 (必选，用于区分企业法人):", self.customer_type_col_combo)
         
         # 担当人员列（可选）
         self.staff_col_combo = QComboBox()
@@ -281,8 +298,11 @@ class ExcelToDbWidget(QWidget):
         info_label = QLabel("""
 <b>Excel导入客户表说明:</b><br>
 • 目标表: ba_rlb_customer<br>
+• <b>两步导入流程:</b><br>
+&nbsp;&nbsp;1. 先点「导入非企业法人」: 导入客户类型≠"企业法人"的记录，is_customer=1<br>
+&nbsp;&nbsp;2. 再点「导入企业法人」: 导入客户类型="企业法人"的记录，如果不存在则is_customer=2<br>
 • 法人姓名列: 必选，对应 legal_name 字段<br>
-• 客户类型列: 可选，如果值是"企业法人"则 is_customer=2，否则为1<br>
+• 客户类型列: 必选，用于区分企业法人/非企业法人<br>
 • 担当人员列: 可选，在 ba_admin 表中匹配 username 或 nickname<br>
 • 导入前检查: 根据选择的字段检查是否已存在，存在则跳过<br>
 • 自动填充: create_time, update_time, remark="系统导入"
@@ -296,10 +316,17 @@ class ExcelToDbWidget(QWidget):
         # 操作按钮区域
         button_layout = QHBoxLayout()
         
-        self.import_btn = QPushButton("开始导入")
-        self.import_btn.clicked.connect(self.start_import)
-        self.import_btn.setEnabled(False)
-        button_layout.addWidget(self.import_btn)
+        self.import_non_corporate_btn = QPushButton("第一步：导入非企业法人")
+        self.import_non_corporate_btn.clicked.connect(self.start_import_non_corporate)
+        self.import_non_corporate_btn.setEnabled(False)
+        self.import_non_corporate_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;")
+        button_layout.addWidget(self.import_non_corporate_btn)
+        
+        self.import_corporate_btn = QPushButton("第二步：导入企业法人")
+        self.import_corporate_btn.clicked.connect(self.start_import_corporate)
+        self.import_corporate_btn.setEnabled(False)
+        self.import_corporate_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 8px;")
+        button_layout.addWidget(self.import_corporate_btn)
         
         button_layout.addStretch()
         
@@ -435,9 +462,9 @@ class ExcelToDbWidget(QWidget):
             self.legal_name_col_combo.addItem(text, idx)
         self.legal_name_col_combo.setEnabled(True)
         
-        # 客户类型列（可选）
+        # 客户类型列（必选）
         self.customer_type_col_combo.clear()
-        self.customer_type_col_combo.addItem("不使用", -1)
+        self.customer_type_col_combo.addItem("请选择列", -1)
         for text, idx in col_options:
             self.customer_type_col_combo.addItem(text, idx)
         self.customer_type_col_combo.setEnabled(True)
@@ -449,8 +476,8 @@ class ExcelToDbWidget(QWidget):
             self.staff_col_combo.addItem(text, idx)
         self.staff_col_combo.setEnabled(True)
         
-        # 尝试自动匹配
-        self.auto_match_columns(columns)
+        # 不自动匹配，让用户手动选择
+        # self.auto_match_columns(columns)
     
     def auto_match_columns(self, columns):
         """尝试自动匹配常见列名"""
@@ -486,8 +513,12 @@ class ExcelToDbWidget(QWidget):
         has_file = bool(self.input_file)
         legal_name_selected = (self.legal_name_col_combo.currentData() is not None and 
                                self.legal_name_col_combo.currentData() >= 0)
+        customer_type_selected = (self.customer_type_col_combo.currentData() is not None and
+                                  self.customer_type_col_combo.currentData() >= 0)
         
-        self.import_btn.setEnabled(has_datasource and has_file and legal_name_selected)
+        can_import = has_datasource and has_file and legal_name_selected and customer_type_selected
+        self.import_non_corporate_btn.setEnabled(can_import)
+        self.import_corporate_btn.setEnabled(can_import)
     
     def get_column_mapping(self):
         """获取列映射配置"""
@@ -497,7 +528,15 @@ class ExcelToDbWidget(QWidget):
             'staff': self.staff_col_combo.currentData() if self.staff_col_combo.currentData() >= 0 else None
         }
     
-    def start_import(self):
+    def start_import_non_corporate(self):
+        """开始导入非企业法人"""
+        self._start_import('non_corporate')
+    
+    def start_import_corporate(self):
+        """开始导入企业法人"""
+        self._start_import('corporate')
+    
+    def _start_import(self, import_mode):
         """开始导入"""
         datasource = self.datasource_combo.currentData()
         if not datasource or not self.input_file:
@@ -507,21 +546,28 @@ class ExcelToDbWidget(QWidget):
         column_mapping = self.get_column_mapping()
         check_field = self.check_field_combo.currentData()
         
+        mode_name = "非企业法人" if import_mode == 'non_corporate' else "企业法人"
+        is_customer_value = 1 if import_mode == 'non_corporate' else 2
+        
         # 构建映射说明
         mapping_info = []
         mapping_info.append(f"法人姓名: {self.legal_name_col_combo.currentText()}")
         mapping_info.append(f"客户类型: {self.customer_type_col_combo.currentText()}")
         mapping_info.append(f"担当人员: {self.staff_col_combo.currentText()}")
         mapping_info.append(f"重复检查: {self.check_field_combo.currentText()}")
+        mapping_info.append(f"导入模式: {mode_name}")
+        mapping_info.append(f"is_customer值: {is_customer_value}")
         
         reply = QMessageBox.question(
             self,
-            "确认导入",
-            f"确定要将Excel数据导入到数据库吗？\n\n"
+            f"确认导入 - {mode_name}",
+            f"确定要导入【{mode_name}】数据吗？\n\n"
             f"数据库: {datasource.name}\n"
             f"目标表: ba_rlb_customer\n\n"
             f"列映射配置:\n" + "\n".join(mapping_info) + "\n\n"
-            f"已存在的记录将被跳过。",
+            f"• 只导入客户类型{'≠' if import_mode == 'non_corporate' else '='}「企业法人」的记录\n"
+            f"• 新建的客户 is_customer={is_customer_value}\n"
+            f"• 已存在的记录将被跳过",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
@@ -529,13 +575,14 @@ class ExcelToDbWidget(QWidget):
         if reply != QMessageBox.Yes:
             return
         
-        self.import_btn.setEnabled(False)
+        self.import_non_corporate_btn.setEnabled(False)
+        self.import_corporate_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self.result_label.setText("正在导入中...")
+        self.result_label.setText(f"正在导入{mode_name}...")
         self.log_text.clear()
         
-        self.worker = ExcelToDbWorker(self.input_file, datasource, self.db_manager, column_mapping, check_field)
+        self.worker = ExcelToDbWorker(self.input_file, datasource, self.db_manager, column_mapping, check_field, import_mode)
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log_message.connect(self.append_log)
         self.worker.finished.connect(self.on_import_finished)
@@ -549,13 +596,14 @@ class ExcelToDbWidget(QWidget):
     
     def on_import_finished(self, results):
         """导入完成"""
-        self.import_btn.setEnabled(True)
+        self.update_import_button_state()
         self.progress_bar.setVisible(False)
         
         result_text = (
             f"导入完成！\n"
             f"总计：{results['total']} 行\n"
             f"成功：{results['success']} 行\n"
+            f"跳过(类型不匹配)：{results['skipped_wrong_type']} 行\n"
             f"跳过(空值)：{results['skipped_empty']} 行\n"
             f"跳过(已存在)：{results['skipped_exists']} 行\n"
             f"失败：{results['failed']} 行"
@@ -568,7 +616,7 @@ class ExcelToDbWidget(QWidget):
     
     def on_import_error(self, error_msg):
         """导入错误"""
-        self.import_btn.setEnabled(True)
+        self.update_import_button_state()
         self.progress_bar.setVisible(False)
         self.result_label.setText("导入失败！")
         self.result_label.setStyleSheet("color: red;")

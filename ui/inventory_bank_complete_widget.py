@@ -488,8 +488,8 @@ class InventoryBankCompleteWidget(QWidget):
             self.site_type_col_combo.addItem(text, idx)
         self.site_type_col_combo.setEnabled(True)
         
-        # 尝试自动匹配
-        self.auto_match_columns(columns)
+        # 不自动匹配，让用户手动选择
+        # self.auto_match_columns(columns)
     
     def auto_match_columns(self, columns):
         """尝试自动匹配常见列名"""

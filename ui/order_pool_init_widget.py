@@ -172,6 +172,7 @@ class OrderPoolInitWorker(QThread):
             company_country = self.get_cell_value(row, 'company_country')
             attribute_value = self.get_cell_value(row, 'attribute')
             territory_abbr = self.get_cell_value(row, 'territory_abbr')
+            status_value = self.get_cell_value(row, 'status')
             
             if not platform_name:
                 raise Exception("平台名称为空")
@@ -180,8 +181,18 @@ class OrderPoolInitWorker(QThread):
             if not territory_abbr:
                 raise Exception("属地简称为空")
             
+            # 根据状态值决定 regist_status 和 status
+            # 完成 → 4, 其他 → 2
+            if status_value and status_value == "完成":
+                regist_status = 4
+                order_status = 4
+            else:
+                regist_status = 2
+                order_status = 2
+            
             country_info = f", 企业国别={company_country}" if company_country else ""
-            self.log_message.emit(f"第{row_num}行: 处理平台={platform_name}, 属性={attribute_value}, 属地={territory_abbr}{country_info}")
+            status_info = f", 状态={status_value}→regist_status={regist_status}"
+            self.log_message.emit(f"第{row_num}行: 处理平台={platform_name}, 属性={attribute_value}, 属地={territory_abbr}{country_info}{status_info}")
             
             platform_info = self.get_platform_info(cursor, platform_name)
             if not platform_info:
@@ -200,7 +211,8 @@ class OrderPoolInitWorker(QThread):
             order_id = self.generate_order_id()
             
             primary_key_id = self.insert_order(cursor, order_id, platform_id, platform_type, shudi_id, 
-                                              attribute_enum, attribute_value, company_country, row_num)
+                                              attribute_enum, attribute_value, company_country, row_num,
+                                              regist_status, order_status)
             
             self.log_message.emit(f"第{row_num}行: 成功创建订单 {order_id}，主键ID: {primary_key_id}")
             
@@ -237,9 +249,13 @@ class OrderPoolInitWorker(QThread):
         return attribute_mapping.get(attribute_value)
     
     def insert_order(self, cursor, order_id, platform_id, platform_type, shudi_id, 
-                    attribute_enum, attribute_value, company_country, row_num):
+                    attribute_enum, attribute_value, company_country, row_num,
+                    regist_status, order_status):
         """插入订单记录"""
         current_time = int(datetime.now().timestamp())
+        
+        # done_number: 完成状态为1，其他为0
+        done_number = 1 if order_status == 4 else 0
         
         insert_data = {
             'order_id': order_id,
@@ -250,15 +266,15 @@ class OrderPoolInitWorker(QThread):
             'attribute': attribute_enum,
             'order_number': 1,
             'rejected_number': 0,
-            'done_number': 1,
-            'status': 4,
+            'done_number': done_number,
+            'status': order_status,
             'demand': '系统初始化数据',
             'feedback': '',
             'admin_id': 1,
             'admin_dept_id': 1,
             'create_time': current_time,
             'update_time': current_time,
-            'regesit_status': 4,
+            'regesit_status': regist_status,
             'need_data_type': 1,
             'rlb_status': 1
         }
@@ -367,6 +383,12 @@ class OrderPoolInitWidget(QWidget):
         self.territory_col_combo.currentIndexChanged.connect(self.update_start_button_state)
         mapping_layout.addRow("属地简称列 (用于查找ba_shudi):", self.territory_col_combo)
         
+        # 状态列（用于决定regist_status和status）
+        self.status_col_combo = QComboBox()
+        self.status_col_combo.setEnabled(False)
+        self.status_col_combo.currentIndexChanged.connect(self.update_start_button_state)
+        mapping_layout.addRow("状态列 (完成→4, 其他→2):", self.status_col_combo)
+        
         mapping_group.setLayout(mapping_layout)
         layout.addWidget(mapping_group)
         
@@ -392,7 +414,8 @@ class OrderPoolInitWidget(QWidget):
 • shop_type: 从ba_platform.platform_type获取 | regist_department: 固定为opt0(平台注册部)<br>
 • platform_id: 从ba_platform.id获取 | shudi_id: 从ba_shudi.id获取<br>
 • attribute: 个人→opt0, 个人事业主→opt1, 企业法人→opt2 | company_country: 企业法人时从对应列获取<br>
-<b>固定字段值:</b> order_number: 1, done_number: 1, status: 4(已完成), regesit_status: 4(已完成), admin_id: 1, admin_dept_id: 1
+<b>状态逻辑:</b> 状态列值为「完成」→ status=4, regesit_status=4, done_number=1; 其他 → status=2, regesit_status=2, done_number=0<br>
+<b>固定字段值:</b> order_number: 1, admin_id: 1, admin_dept_id: 1
         """)
         info_label.setWordWrap(True)
         info_layout.addWidget(info_label)
@@ -551,8 +574,15 @@ class OrderPoolInitWidget(QWidget):
             self.territory_col_combo.addItem(text, idx)
         self.territory_col_combo.setEnabled(True)
         
-        # 尝试自动匹配常见列名
-        self.auto_match_columns(columns)
+        # 状态列
+        self.status_col_combo.clear()
+        self.status_col_combo.addItem("请选择列", -1)
+        for text, idx in col_options:
+            self.status_col_combo.addItem(text, idx)
+        self.status_col_combo.setEnabled(True)
+        
+        # 不自动匹配，让用户手动选择
+        # self.auto_match_columns(columns)
     
     def auto_match_columns(self, columns):
         """尝试自动匹配常见列名"""
@@ -567,6 +597,8 @@ class OrderPoolInitWidget(QWidget):
                 self.attribute_col_combo.setCurrentIndex(i + 1)
             elif '属地' in col_lower or '简称' in col_lower:
                 self.territory_col_combo.setCurrentIndex(i + 1)
+            elif '状态' in col_lower or '进度' in col_lower:
+                self.status_col_combo.setCurrentIndex(i + 1)
     
     def show_preview(self):
         """显示数据预览"""
@@ -595,10 +627,11 @@ class OrderPoolInitWidget(QWidget):
         platform_selected = self.platform_col_combo.currentData() is not None and self.platform_col_combo.currentData() >= 0
         attribute_selected = self.attribute_col_combo.currentData() is not None and self.attribute_col_combo.currentData() >= 0
         territory_selected = self.territory_col_combo.currentData() is not None and self.territory_col_combo.currentData() >= 0
+        status_selected = self.status_col_combo.currentData() is not None and self.status_col_combo.currentData() >= 0
         
         self.start_btn.setEnabled(
             datasource_selected and file_selected and 
-            platform_selected and attribute_selected and territory_selected
+            platform_selected and attribute_selected and territory_selected and status_selected
         )
     
     def get_column_mapping(self):
@@ -607,7 +640,8 @@ class OrderPoolInitWidget(QWidget):
             'platform_name': self.platform_col_combo.currentData(),
             'company_country': self.country_col_combo.currentData() if self.country_col_combo.currentData() >= 0 else None,
             'attribute': self.attribute_col_combo.currentData(),
-            'territory_abbr': self.territory_col_combo.currentData()
+            'territory_abbr': self.territory_col_combo.currentData(),
+            'status': self.status_col_combo.currentData()
         }
     
     def start_import(self):
@@ -625,6 +659,7 @@ class OrderPoolInitWidget(QWidget):
         mapping_info.append(f"企业国别: {self.country_col_combo.currentText()}")
         mapping_info.append(f"属性: {self.attribute_col_combo.currentText()}")
         mapping_info.append(f"属地简称: {self.territory_col_combo.currentText()}")
+        mapping_info.append(f"状态: {self.status_col_combo.currentText()}")
         
         reply = QMessageBox.question(
             self,

@@ -20,13 +20,14 @@ class SyncInventoryWorker(QThread):
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
     
-    def __init__(self, datasource, excel_file, ptzcb_column, legal_column, bank_column, status_column, register_department):
+    def __init__(self, datasource, excel_file, ptzcb_column, legal_column, bank_column, bank_card_column, status_column, register_department):
         super().__init__()
         self.datasource = datasource
         self.excel_file = excel_file
         self.ptzcb_column = ptzcb_column  # ba_ptzcb_register查找列
         self.legal_column = legal_column  # 法人姓名列
         self.bank_column = bank_column    # 银行名称列
+        self.bank_card_column = bank_card_column  # 银行卡号列
         self.status_column = status_column # 状态列
         self.register_department = register_department
         self.results = {
@@ -124,12 +125,13 @@ class SyncInventoryWorker(QThread):
             ptzcb_value = str(row[self.ptzcb_column]).strip() if self.ptzcb_column in row.index else ""
             legal_name = str(row[self.legal_column]).strip() if self.legal_column in row.index else ""
             bank_name = str(row[self.bank_column]).strip() if self.bank_column in row.index else ""
+            bank_card_no = str(row[self.bank_card_column]).strip() if self.bank_card_column in row.index else ""
             status_value = str(row[self.status_column]).strip() if self.status_column in row.index else ""
             
             if not ptzcb_value or ptzcb_value == 'nan':
                 raise Exception(f"PTZCB查找列为空")
             
-            self.log_message.emit(f"第{row_num}行: 处理数据 - PTZCB值={ptzcb_value}, 法人={legal_name}, 银行={bank_name}, 状态={status_value}")
+            self.log_message.emit(f"第{row_num}行: 处理数据 - PTZCB值={ptzcb_value}, 法人={legal_name}, 银行={bank_name}, 银行卡号={bank_card_no}, 状态={status_value}")
             
             # 第一步：根据ptzcb_value查找ba_ptzcb_register记录
             ptzcb_record = self.find_ptzcb_record(cursor, ptzcb_value)
@@ -144,7 +146,7 @@ class SyncInventoryWorker(QThread):
             inventory_num = self.generate_inventory_num(platform_info['code'], shudi_info['territory_abbreviation'])
             
             # 第四步：查找银行信息
-            bank_id = self.find_bank_id(cursor, legal_name, bank_name, row_num)
+            bank_id = self.find_bank_id(cursor, legal_name, bank_name, bank_card_no, row_num)
             
             # 第五步：获取货币ID
             currency_id = self.get_currency_id(cursor, bank_id) if bank_id else None
@@ -219,9 +221,22 @@ class SyncInventoryWorker(QThread):
         
         return f"{platform_code}-{territory_abbr}-{year_month}-{sequence}"
     
-    def find_bank_id(self, cursor, legal_name, bank_name, row_num):
+    def find_bank_id(self, cursor, legal_name, bank_name, bank_card_no, row_num):
         """查找银行ID（可选，找不到不报错）"""
         try:
+            # 如果银行卡号不为空，优先用银行卡号查找
+            if bank_card_no and bank_card_no.strip() != '' and bank_card_no != 'nan':
+                cursor.execute("""
+                    SELECT id FROM ba_zhb_bank 
+                    WHERE bank_card_number = %s
+                    ORDER BY update_time DESC
+                    LIMIT 1
+                """, (bank_card_no,))
+                bank_record = cursor.fetchone()
+                if bank_record:
+                    self.log_message.emit(f"  第{row_num}行: 通过银行卡号 {bank_card_no} 找到银行ID: {bank_record['id']}")
+                    return bank_record['id']
+            
             # 如果银行名称为空，直接返回None（不报错）
             if not bank_name or bank_name.strip() == '' or bank_name == 'nan':
                 return None
@@ -251,6 +266,8 @@ class SyncInventoryWorker(QThread):
             """, (customer_id, bank_name_id))
             
             bank_record = cursor.fetchone()
+            if bank_record:
+                self.log_message.emit(f"  第{row_num}行: 通过法人+银行名称找到银行ID: {bank_record['id']}")
             return bank_record['id'] if bank_record else None
                 
         except Exception as e:
@@ -369,6 +386,10 @@ class SyncInventoryWidget(QWidget):
         self.bank_column_combo.setEnabled(False)
         column_layout.addRow("银行名称列:", self.bank_column_combo)
         
+        self.bank_card_column_combo = QComboBox()
+        self.bank_card_column_combo.setEnabled(False)
+        column_layout.addRow("银行卡号列:", self.bank_card_column_combo)
+        
         self.status_column_combo = QComboBox()
         self.status_column_combo.setEnabled(False)
         column_layout.addRow("状态列:", self.status_column_combo)
@@ -400,6 +421,7 @@ class SyncInventoryWidget(QWidget):
    • <b>PTZCB查找列</b>: 用于查找ba_ptzcb_register表的project_id或id<br>
    • <b>法人姓名列</b>: 用于查找ba_rlb_customer表<br>
    • <b>银行名称列</b>: 用于查找ba_zhb_bank_name表<br>
+   • <b>银行卡号列</b>: 优先用银行卡号直接查找ba_zhb_bank表<br>
    • <b>状态列</b>: 用于转换account_status<br>
 3. 设置注册部门名称<br><br>
 <b>库存编号生成规则:</b><br>
@@ -526,8 +548,9 @@ class SyncInventoryWidget(QWidget):
                 
                 # 填充列选择下拉框
                 for combo in [self.ptzcb_column_combo, self.legal_column_combo, 
-                             self.bank_column_combo, self.status_column_combo]:
+                             self.bank_column_combo, self.bank_card_column_combo, self.status_column_combo]:
                     combo.clear()
+                    combo.addItem("请选择列")  # 默认选项
                     combo.addItems(self.excel_columns)
                     combo.setEnabled(True)
                 
@@ -560,11 +583,16 @@ class SyncInventoryWidget(QWidget):
         ptzcb_column = self.ptzcb_column_combo.currentText()
         legal_column = self.legal_column_combo.currentText()
         bank_column = self.bank_column_combo.currentText()
+        bank_card_column = self.bank_card_column_combo.currentText()
         status_column = self.status_column_combo.currentText()
         register_department = self.register_department_edit.text().strip()
         
-        if not all([ptzcb_column, legal_column, bank_column, status_column, register_department]):
-            QMessageBox.warning(self, "警告", "请完整填写所有选项！")
+        # 检查是否选择了有效的列（不能是"请选择列"）
+        if ptzcb_column == "请选择列" or legal_column == "请选择列" or bank_column == "请选择列" or bank_card_column == "请选择列" or status_column == "请选择列":
+            QMessageBox.warning(self, "警告", "请选择所有必要的列！")
+            return
+        if not register_department:
+            QMessageBox.warning(self, "警告", "请填写注册部门！")
             return
         
         # 确认对话框
@@ -577,6 +605,7 @@ class SyncInventoryWidget(QWidget):
             f"PTZCB查找列: {ptzcb_column}\n"
             f"法人姓名列: {legal_column}\n"
             f"银行名称列: {bank_column}\n"
+            f"银行卡号列: {bank_card_column}\n"
             f"状态列: {status_column}\n"
             f"注册部门: {register_department}\n\n"
             f"操作不可撤销，请确认数据正确！",
@@ -601,7 +630,7 @@ class SyncInventoryWidget(QWidget):
         # 启动工作线程
         self.worker = SyncInventoryWorker(
             datasource, self.excel_file, ptzcb_column, legal_column, 
-            bank_column, status_column, register_department
+            bank_column, bank_card_column, status_column, register_department
         )
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log_message.connect(self.append_log)

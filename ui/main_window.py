@@ -172,7 +172,7 @@ class MainWindow(QMainWindow):
         self.function_combo.addItem("Excel导入客户表", "excel_to_db")
         self.function_combo.addItem("Excel导入法人信息", "legal_info_import")
         self.function_combo.addItem("补全主体编号", "shopindex_complete")
-        self.function_combo.addItem("补全平台详情信息", "platform_info_complete")
+        self.function_combo.addItem("补全平台详情信息（弃用）", "platform_info_complete")
         self.function_combo.addItem("修改平台详情状态", "platform_status_update")
         self.function_combo.addItem("现有客户银行信息补全", "bank_info_sync")
         self.function_combo.addItem("补全现有库存关联银行卡信息", "inventory_bank_complete")
