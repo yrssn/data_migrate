@@ -90,8 +90,9 @@ class PlatformInfoPreprocessWorker(QThread):
         shopindex_id = record['shopindex_id']
         shudi_id = record['shudi_id']
         platform_id = record['platform_id']
+        register_status = record.get('status', 1)
         
-        self.log_message.emit(f"处理记录 ID={register_id}, shopindex_id={shopindex_id}, shudi_id={shudi_id}, platform_id={platform_id}")
+        self.log_message.emit(f"处理记录 ID={register_id}, shopindex_id={shopindex_id}, shudi_id={shudi_id}, platform_id={platform_id}, status={register_status}")
         
         # 检查必要字段
         if not shopindex_id:
@@ -111,6 +112,17 @@ class PlatformInfoPreprocessWorker(QThread):
         
         current_time = int(datetime.now().timestamp())
         
+        # 根据ba_ptzcb_register.status决定写入ba_platform_info的status值
+        # ba_ptzcb_register.status: 0=待指派,1=进行中,2=审核中,3=银行验证,4=审核失败,5=银行卡验证失败,
+        #                           6=完成,7=失败,8=取消,9=暂停,10=店铺验证失败,11=店铺验证中
+        # ba_platform_info.status: 0=失效,1=可用,2=已用,3=取消
+        if register_status == 8:  # 取消 -> 3
+            target_status = 3
+        elif register_status == 7:  # 失败 -> 0
+            target_status = 0
+        else:
+            target_status = 2  # 其他情况默认已用
+        
         # 在ba_platform_info中查找是否存在对应记录
         cursor.execute("""
             SELECT id, status 
@@ -122,29 +134,29 @@ class PlatformInfoPreprocessWorker(QThread):
         platform_info = cursor.fetchone()
         
         if platform_info:
-            # 找到了，更新status为2
-            if platform_info['status'] == 2:
-                self.log_message.emit(f"  记录ID {register_id}: ba_platform_info中已存在且status已经是2，跳过")
+            # 找到了，更新status
+            if platform_info['status'] == target_status:
+                self.log_message.emit(f"  记录ID {register_id}: ba_platform_info中已存在且status已经是{target_status}，跳过")
                 self.results['skipped_count'] += 1
             else:
                 cursor.execute("""
                     UPDATE ba_platform_info 
-                    SET status = 2, update_time = %s 
+                    SET status = %s, update_time = %s 
                     WHERE id = %s
-                """, (current_time, platform_info['id']))
+                """, (target_status, current_time, platform_info['id']))
                 self.results['updated_count'] += 1
-                self.log_message.emit(f"  记录ID {register_id}: 更新ba_platform_info.id={platform_info['id']} status从{platform_info['status']}改为2")
+                self.log_message.emit(f"  记录ID {register_id}: 更新ba_platform_info.id={platform_info['id']} status从{platform_info['status']}改为{target_status}")
         else:
             # 没找到，插入新记录
             cursor.execute("""
                 INSERT INTO ba_platform_info 
                 (shopindex_id, shudi_id, platform_id, status, create_time, update_time, admin_id, admin_dept_id)
-                VALUES (%s, %s, %s, 2, %s, %s, 1, 1)
-            """, (shopindex_id, shudi_id, platform_id, current_time, current_time))
+                VALUES (%s, %s, %s, %s, %s, %s, 1, 1)
+            """, (shopindex_id, shudi_id, platform_id, target_status, current_time, current_time))
             
             new_id = cursor.lastrowid
             self.results['inserted_count'] += 1
-            self.log_message.emit(f"  记录ID {register_id}: 插入新记录到ba_platform_info，新ID={new_id}，status=2")
+            self.log_message.emit(f"  记录ID {register_id}: 插入新记录到ba_platform_info，新ID={new_id}，status={target_status}")
 
 
 class PlatformInfoPreprocessWidget(QWidget):
@@ -197,12 +209,16 @@ class PlatformInfoPreprocessWidget(QWidget):
 <b>平台注册部平台详情预先处理说明:</b><br>
 <b>处理逻辑:</b><br>
 • 1. 从ba_ptzcb_register表中查找备注(remark)包含指定关键词的记录<br>
-• 2. 获取每条记录的 shopindex_id, shudi_id, platform_id<br>
-• 3. 在ba_platform_info表中查找是否存在相同组合的记录:<br>
-&nbsp;&nbsp;- 如果存在: 将该记录的status更新为2(已用)<br>
-&nbsp;&nbsp;- 如果不存在: 插入新记录，status设为2(已用)<br><br>
+• 2. 获取每条记录的 shopindex_id, shudi_id, platform_id, status<br>
+• 3. 根据ba_ptzcb_register.status映射ba_platform_info.status:<br>
+&nbsp;&nbsp;- status=8(取消) → 3(取消)<br>
+&nbsp;&nbsp;- status=7(失败) → 0(失效)<br>
+&nbsp;&nbsp;- 其他 → 2(已用)<br>
+• 4. 在ba_platform_info表中查找是否存在相同组合的记录:<br>
+&nbsp;&nbsp;- 如果存在: 更新status<br>
+&nbsp;&nbsp;- 如果不存在: 插入新记录<br><br>
 <b>ba_platform_info.status状态说明:</b><br>
-• 0=失败, 1=可用, 2=已用, 3=取消
+• 0=失效, 1=可用, 2=已用, 3=取消
         """)
         info_label.setWordWrap(True)
         info_layout.addWidget(info_label)

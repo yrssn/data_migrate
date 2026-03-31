@@ -38,6 +38,7 @@ from .status_change_widget import StatusChangeWidget
 from .platform_info_preprocess_widget import PlatformInfoPreprocessWidget
 from .extract_by_column_widget import ExtractByColumnWidget
 from .platform_exist_precheck_widget import PlatformExistPrecheckWidget
+from .inventory_bank_fill_widget import InventoryBankFillWidget
 
 
 class MainWindow(QMainWindow):
@@ -385,6 +386,7 @@ class MainWindow(QMainWindow):
         self.function_combo2.addItem("平台注册部平台详情预先处理", "platform_info_preprocess")
         self.function_combo2.addItem("去除平台重复数据", "extract_by_column")
         self.function_combo2.addItem("平台存在预检测", "platform_exist_precheck")
+        self.function_combo2.addItem("根据库存ID补全银行卡", "inventory_bank_fill")
         self.function_combo2.currentTextChanged.connect(self.on_function_changed2)
         function_layout.addWidget(self.function_combo2)
 
@@ -409,6 +411,9 @@ class MainWindow(QMainWindow):
 
         self.platform_exist_precheck_widget = PlatformExistPrecheckWidget(self.db_manager)
         self.function_stack2.addWidget(self.platform_exist_precheck_widget)
+
+        self.inventory_bank_fill_widget = InventoryBankFillWidget(self.db_manager)
+        self.function_stack2.addWidget(self.inventory_bank_fill_widget)
 
         # 占位页面（其他功能）
         placeholder_widget = QWidget()
@@ -435,8 +440,10 @@ class MainWindow(QMainWindow):
             self.function_stack2.setCurrentIndex(2)
         elif "平台存在预检测" in text:
             self.function_stack2.setCurrentIndex(3)
-        else:
+        elif "根据库存ID补全银行卡" in text:
             self.function_stack2.setCurrentIndex(4)
+        else:
+            self.function_stack2.setCurrentIndex(5)
     
     def load_datasources(self):
         """加载数据源列表"""

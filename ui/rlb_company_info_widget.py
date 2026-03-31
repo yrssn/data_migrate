@@ -20,11 +20,12 @@ class RlbCompanyInfoWorker(QThread):
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
     
-    def __init__(self, datasource, db_manager, selected_records):
+    def __init__(self, datasource, db_manager, selected_records, fill_mode='company_info'):
         super().__init__()
         self.datasource = datasource
         self.db_manager = db_manager
         self.selected_records = selected_records  # 用户选择的记录ID列表
+        self.fill_mode = fill_mode  # 'company_info' 或 'address_other'
         self.results = {
             'total': 0,
             'success': 0,
@@ -55,7 +56,10 @@ class RlbCompanyInfoWorker(QThread):
             # 处理每个选中的记录
             for index, record_id in enumerate(self.selected_records):
                 try:
-                    self.update_company_info(cursor, record_id, index + 1)
+                    if self.fill_mode == 'company_info':
+                        self.update_company_info(cursor, record_id, index + 1)
+                    else:
+                        self.update_address_other(cursor, record_id, index + 1)
                     self.results['success'] += 1
                     
                     # 更新进度
@@ -122,7 +126,47 @@ class RlbCompanyInfoWorker(QThread):
                 record_id
             ))
             
-            self.log_message.emit(f"第{sequence}条: 成功更新公司 '{company_name}' (ID: {record_id}) 的基础信息")
+            self.log_message.emit(f"第{sequence}条: 成功更新公司 '{company_name}' (ID: {record_id}) 的company_information")
+            
+        except Exception as e:
+            raise Exception(f"更新记录失败: {str(e)}")
+    
+    def update_address_other(self, cursor, record_id, sequence):
+        """更新单条记录的公司地址信息"""
+        try:
+            # 先查询当前记录信息
+            cursor.execute("""
+                SELECT id, company_name, country, company_address_other
+                FROM ba_rlb_legal_information 
+                WHERE id = %s AND create_staff = '系统导入'
+            """, (record_id,))
+            
+            record = cursor.fetchone()
+            if not record:
+                raise Exception(f"未找到ID为 {record_id} 且create_staff为'系统导入'的记录")
+            
+            record_id, company_name, country, current_address = record
+            
+            # 生成标准的公司地址模板
+            address_template = """会社住所郵便番号：
+会社住所(日本語)：
+会社住所(平仮名)：
+会社住所(力タ力ナ)：
+会社住所(英語)："""
+            
+            # 只更新company_address_other字段
+            cursor.execute("""
+                UPDATE ba_rlb_legal_information 
+                SET company_address_other = %s,
+                    update_time = %s
+                WHERE id = %s
+            """, (
+                address_template,
+                int(datetime.now().timestamp()),
+                record_id
+            ))
+            
+            self.log_message.emit(f"第{sequence}条: 成功更新公司 '{company_name}' (ID: {record_id}) 的company_address_other")
             
         except Exception as e:
             raise Exception(f"更新记录失败: {str(e)}")
@@ -167,19 +211,18 @@ class RlbCompanyInfoWidget(QWidget):
 <b>功能描述:</b><br>
 • 检测ba_rlb_legal_information表中create_staff字段为"系统导入"的记录<br>
 • 为这些记录补充标准的日本公司信息模板<br><br>
-<b>补充内容:</b><br>
-• <b>company_information字段</b>: 补充为标准公司信息模板<br><br>
-<b>公司信息模板格式:</b><br>
-会社法人番号: <br>
-会社名(漢字)： <br>
-会社名(平仮名)： <br>
-会社名(力タ力ナ)： <br>
-会社名(英語)：<br><br>
+<b>补充内容（分开运行）:</b><br>
+• <b>company_information字段</b>: 公司名称信息模板<br>
+• <b>company_address_other字段</b>: 公司地址信息模板<br><br>
+<b>company_information模板:</b><br>
+会社法人番号: / 会社名(漢字)： / 会社名(平仮名)： / 会社名(力タ力ナ)： / 会社名(英語)：<br><br>
+<b>company_address_other模板:</b><br>
+会社住所郵便番号： / 会社住所(日本語)： / 会社住所(平仮名)： / 会社住所(力タ力ナ)： / 会社住所(英語)：<br><br>
 <b>操作流程:</b><br>
 1. 选择数据源并测试连接<br>
 2. 点击"查询待补全记录"加载数据<br>
 3. 在表格中选择需要补全的记录（支持多选）<br>
-4. 点击"开始补全"执行更新操作
+4. 点击对应按钮分别补全不同字段
         """)
         info_label.setWordWrap(True)
         info_layout.addWidget(info_label)
@@ -235,10 +278,17 @@ class RlbCompanyInfoWidget(QWidget):
         # 操作按钮区域
         button_layout = QHBoxLayout()
         
-        self.start_btn = QPushButton("开始补全")
-        self.start_btn.clicked.connect(self.start_update)
-        self.start_btn.setEnabled(False)
-        button_layout.addWidget(self.start_btn)
+        self.start_company_info_btn = QPushButton("补全 company_information")
+        self.start_company_info_btn.clicked.connect(lambda: self.start_update('company_info'))
+        self.start_company_info_btn.setEnabled(False)
+        self.start_company_info_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px 16px;")
+        button_layout.addWidget(self.start_company_info_btn)
+        
+        self.start_address_other_btn = QPushButton("补全 company_address_other")
+        self.start_address_other_btn.clicked.connect(lambda: self.start_update('address_other'))
+        self.start_address_other_btn.setEnabled(False)
+        self.start_address_other_btn.setStyleSheet("background-color: #2196F3; color: white; padding: 8px 16px;")
+        button_layout.addWidget(self.start_address_other_btn)
         
         button_layout.addStretch()
         
@@ -434,7 +484,8 @@ class RlbCompanyInfoWidget(QWidget):
         
         self.select_all_btn.setEnabled(has_records)
         self.deselect_all_btn.setEnabled(has_records)
-        self.start_btn.setEnabled(has_selection)
+        self.start_company_info_btn.setEnabled(has_selection)
+        self.start_address_other_btn.setEnabled(has_selection)
     
     def start_update(self):
         """开始补全"""
