@@ -107,6 +107,12 @@ class RlbCompanyInfoWorker(QThread):
             
             record_id, company_name, country, current_information = record
             
+            # 检查是否已有内容，有内容则跳过
+            if current_information and current_information.strip():
+                self.log_message.emit(f"第{sequence}条: 跳过公司 '{company_name}' (ID: {record_id})，company_information已有内容")
+                self.results['skipped'] = self.results.get('skipped', 0) + 1
+                return
+            
             # 生成标准的公司信息模板
             company_template = """会社法人番号: 
 会社名(漢字)： 
@@ -146,6 +152,12 @@ class RlbCompanyInfoWorker(QThread):
                 raise Exception(f"未找到ID为 {record_id} 且create_staff为'系统导入'的记录")
             
             record_id, company_name, country, current_address = record
+            
+            # 检查是否已有内容，有内容则跳过
+            if current_address and current_address.strip():
+                self.log_message.emit(f"第{sequence}条: 跳过公司 '{company_name}' (ID: {record_id})，company_address_other已有内容")
+                self.results['skipped'] = self.results.get('skipped', 0) + 1
+                return
             
             # 生成标准的公司地址模板
             address_template = """会社住所郵便番号：
@@ -487,7 +499,7 @@ class RlbCompanyInfoWidget(QWidget):
         self.start_company_info_btn.setEnabled(has_selection)
         self.start_address_other_btn.setEnabled(has_selection)
     
-    def start_update(self):
+    def start_update(self, fill_mode='company_info'):
         """开始补全"""
         datasource = self.datasource_combo.currentData()
         if not datasource:
@@ -499,13 +511,21 @@ class RlbCompanyInfoWidget(QWidget):
             QMessageBox.warning(self, "警告", "请先选择要补全的记录！")
             return
         
+        # 根据模式确定提示信息
+        if fill_mode == 'company_info':
+            field_name = "company_information"
+            template_desc = "公司名称信息模板（会社法人番号、会社名等）"
+        else:
+            field_name = "company_address_other"
+            template_desc = "公司地址信息模板（会社住所郵便番号、会社住所等）"
+        
         # 确认对话框
         reply = QMessageBox.question(
             self,
             "确认补全",
             f"确定要补全选中的 {len(selected_ids)} 条记录吗？\n\n"
-            f"将为这些记录的company_information字段\n"
-            f"补充标准的日本公司信息模板。",
+            f"将为这些记录的 {field_name} 字段\n"
+            f"补充{template_desc}。",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
@@ -514,15 +534,16 @@ class RlbCompanyInfoWidget(QWidget):
             return
         
         # 禁用按钮，显示进度条
-        self.start_btn.setEnabled(False)
+        self.start_company_info_btn.setEnabled(False)
+        self.start_address_other_btn.setEnabled(False)
         self.query_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self.result_label.setText("正在补全中...")
+        self.result_label.setText(f"正在补全 {field_name} 中...")
         self.log_text.clear()
         
         # 启动工作线程
-        self.worker = RlbCompanyInfoWorker(datasource, self.db_manager, selected_ids)
+        self.worker = RlbCompanyInfoWorker(datasource, self.db_manager, selected_ids, fill_mode)
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log_message.connect(self.append_log)
         self.worker.finished.connect(self.on_update_finished)
@@ -536,14 +557,17 @@ class RlbCompanyInfoWidget(QWidget):
     
     def on_update_finished(self, results):
         """补全完成"""
-        self.start_btn.setEnabled(True)
+        self.start_company_info_btn.setEnabled(True)
+        self.start_address_other_btn.setEnabled(True)
         self.query_btn.setEnabled(True)
         self.progress_bar.setVisible(False)
         
+        skipped = results.get('skipped', 0)
         result_text = (
             f"补全完成！\n"
             f"总计：{results['total']} 条\n"
             f"成功：{results['success']} 条\n"
+            f"跳过（已有内容）：{skipped} 条\n"
             f"失败：{results['failed']} 条"
         )
         
@@ -566,7 +590,8 @@ class RlbCompanyInfoWidget(QWidget):
     
     def on_update_error(self, error_msg):
         """补全错误"""
-        self.start_btn.setEnabled(True)
+        self.start_company_info_btn.setEnabled(True)
+        self.start_address_other_btn.setEnabled(True)
         self.query_btn.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.result_label.setText("补全失败！")

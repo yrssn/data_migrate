@@ -20,14 +20,16 @@ class CustomerInfoCompleteWorker(QThread):
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
     
-    def __init__(self, datasource, db_manager, selected_records):
+    def __init__(self, datasource, db_manager, selected_records, fill_mode='address_info'):
         super().__init__()
         self.datasource = datasource
         self.db_manager = db_manager
         self.selected_records = selected_records  # 用户选择的记录ID列表
+        self.fill_mode = fill_mode  # 'address_info' 或 'name_info'
         self.results = {
             'total': 0,
             'success': 0,
+            'skipped': 0,
             'failed': 0,
             'error_records': []
         }
@@ -55,8 +57,10 @@ class CustomerInfoCompleteWorker(QThread):
             # 处理每个选中的记录
             for index, record_id in enumerate(self.selected_records):
                 try:
-                    self.update_customer_info(cursor, record_id, index + 1)
-                    self.results['success'] += 1
+                    if self.fill_mode == 'address_info':
+                        self.update_address_info(cursor, record_id, index + 1)
+                    else:
+                        self.update_name_info(cursor, record_id, index + 1)
                     
                     # 更新进度
                     progress = 10 + int((index + 1) / len(self.selected_records) * 85)
@@ -87,12 +91,12 @@ class CustomerInfoCompleteWorker(QThread):
         except Exception as e:
             self.error.emit(str(e))
     
-    def update_customer_info(self, cursor, record_id, sequence):
-        """更新单条记录的客户信息"""
+    def update_address_info(self, cursor, record_id, sequence):
+        """更新单条记录的住所信息"""
         try:
             # 先查询当前记录信息
             cursor.execute("""
-                SELECT id, legal_name, company_information
+                SELECT id, legal_name, address_information
                 FROM ba_rlb_customer 
                 WHERE id = %s AND remark = '系统导入'
             """, (record_id,))
@@ -101,28 +105,81 @@ class CustomerInfoCompleteWorker(QThread):
             if not record:
                 raise Exception(f"未找到ID为 {record_id} 且remark为'系统导入'的记录")
             
-            record_id, legal_name, current_company_info = record
+            record_id, legal_name, current_address_info = record
             
-            # 生成标准的公司信息模板
-            company_template = """会社法人番号: 
-会社名(漢字)： 
-会社名(平仮名)： 
-会社名(力タ力ナ)： 
-会社名(英語)："""
+            # 检查是否已有内容，有内容则跳过
+            if current_address_info and current_address_info.strip():
+                self.log_message.emit(f"第{sequence}条: 跳过客户 '{legal_name}' (ID: {record_id})，address_information已有内容")
+                self.results['skipped'] += 1
+                return
             
-            # 只更新company_information字段
+            # 生成标准的住所信息模板
+            address_template = """本人住所(日本語)：
+本人住所(平仮名)：
+本人住所(力タ力ナ)：
+本人住所(英語)：
+本人住所邮编番号："""
+            
+            # 只更新address_information字段
             cursor.execute("""
                 UPDATE ba_rlb_customer 
-                SET company_information = %s,
+                SET address_information = %s,
                     update_time = %s
                 WHERE id = %s
             """, (
-                company_template,
+                address_template,
                 int(datetime.now().timestamp()),
                 record_id
             ))
             
-            self.log_message.emit(f"第{sequence}条: 成功更新客户 '{legal_name}' (ID: {record_id}) 的信息字段")
+            self.results['success'] += 1
+            self.log_message.emit(f"第{sequence}条: 成功更新客户 '{legal_name}' (ID: {record_id}) 的address_information")
+            
+        except Exception as e:
+            raise Exception(f"更新记录失败: {str(e)}")
+    
+    def update_name_info(self, cursor, record_id, sequence):
+        """更新单条记录的姓名信息"""
+        try:
+            # 先查询当前记录信息
+            cursor.execute("""
+                SELECT id, legal_name, name_information
+                FROM ba_rlb_customer 
+                WHERE id = %s AND remark = '系统导入'
+            """, (record_id,))
+            
+            record = cursor.fetchone()
+            if not record:
+                raise Exception(f"未找到ID为 {record_id} 且remark为'系统导入'的记录")
+            
+            record_id, legal_name, current_name_info = record
+            
+            # 检查是否已有内容，有内容则跳过
+            if current_name_info and current_name_info.strip():
+                self.log_message.emit(f"第{sequence}条: 跳过客户 '{legal_name}' (ID: {record_id})，name_information已有内容")
+                self.results['skipped'] += 1
+                return
+            
+            # 生成标准的姓名信息模板
+            name_template = """名前(漢字)：
+名前(平仮名)：
+名前(力タ力ナ)：
+名前(ロ-マ字)："""
+            
+            # 只更新name_information字段
+            cursor.execute("""
+                UPDATE ba_rlb_customer 
+                SET name_information = %s,
+                    update_time = %s
+                WHERE id = %s
+            """, (
+                name_template,
+                int(datetime.now().timestamp()),
+                record_id
+            ))
+            
+            self.results['success'] += 1
+            self.log_message.emit(f"第{sequence}条: 成功更新客户 '{legal_name}' (ID: {record_id}) 的name_information")
             
         except Exception as e:
             raise Exception(f"更新记录失败: {str(e)}")
@@ -166,27 +223,19 @@ class CustomerInfoCompleteWidget(QWidget):
 <b>补全客户信息字段初始值说明:</b><br>
 <b>功能描述:</b><br>
 • 检测ba_rlb_customer表中remark字段为"系统导入"的记录<br>
-• 为这些记录补充标准的公司信息字段模板<br><br>
-<b>补充内容:</b><br>
-• <b>company_address_other字段</b>: 补充为标准公司地址模板<br>
-• <b>company_information字段</b>: 补充为标准公司信息模板<br><br>
-<b>公司地址模板格式:</b><br>
-会社住所郵便番号：<br>
-会社住所(日本語)：<br>
-会社住所(平仮名)：<br>
-会社住所(力タ力ナ)：<br>
-会社住所(英語)：<br><br>
-<b>公司信息模板格式:</b><br>
-会社法人番号: <br>
-会社名(漢字)： <br>
-会社名(平仮名)： <br>
-会社名(力タ力ナ)： <br>
-会社名(英語)：<br><br>
+• 为这些记录补充标准的客户信息字段模板<br><br>
+<b>补充内容（分开运行）:</b><br>
+• <b>address_information字段</b>: 住所信息模板<br>
+• <b>name_information字段</b>: 姓名信息模板<br><br>
+<b>住所信息模板:</b><br>
+本人住所(日本語)： / 本人住所(平仮名)： / 本人住所(力タ力ナ)： / 本人住所(英語)： / 本人住所邮编番号：<br><br>
+<b>姓名信息模板:</b><br>
+名前(漢字)： / 名前(平仮名)： / 名前(力タ力ナ)： / 名前(ロ-マ字)：<br><br>
 <b>操作流程:</b><br>
 1. 选择数据源并测试连接<br>
 2. 点击"查询待补全记录"加载数据<br>
 3. 在表格中选择需要补全的记录（支持多选）<br>
-4. 点击"开始补全"执行更新操作
+4. 点击对应按钮分别补全不同字段
         """)
         info_label.setWordWrap(True)
         info_layout.addWidget(info_label)
@@ -242,10 +291,17 @@ class CustomerInfoCompleteWidget(QWidget):
         # 操作按钮区域
         button_layout = QHBoxLayout()
         
-        self.start_btn = QPushButton("开始补全")
-        self.start_btn.clicked.connect(self.start_update)
-        self.start_btn.setEnabled(False)
-        button_layout.addWidget(self.start_btn)
+        self.start_address_btn = QPushButton("补全 address_information（住所）")
+        self.start_address_btn.clicked.connect(lambda: self.start_update('address_info'))
+        self.start_address_btn.setEnabled(False)
+        self.start_address_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px 16px;")
+        button_layout.addWidget(self.start_address_btn)
+        
+        self.start_name_btn = QPushButton("补全 name_information（姓名）")
+        self.start_name_btn.clicked.connect(lambda: self.start_update('name_info'))
+        self.start_name_btn.setEnabled(False)
+        self.start_name_btn.setStyleSheet("background-color: #2196F3; color: white; padding: 8px 16px;")
+        button_layout.addWidget(self.start_name_btn)
         
         button_layout.addStretch()
         
@@ -342,7 +398,7 @@ class CustomerInfoCompleteWidget(QWidget):
             
             # 查询remark为"系统导入"的记录
             cursor.execute("""
-                SELECT id, legal_name, create_time, update_time, company_information
+                SELECT id, legal_name, create_time, update_time, address_information, name_information
                 FROM ba_rlb_customer 
                 WHERE remark = '系统导入'
                 ORDER BY create_time DESC
@@ -372,13 +428,13 @@ class CustomerInfoCompleteWidget(QWidget):
             return
         
         # 设置表格
-        headers = ["选择", "ID", "法人姓名", "创建时间", "更新时间", "公司地址状态", "公司信息状态"]
+        headers = ["选择", "ID", "法人姓名", "创建时间", "更新时间", "住所信息状态", "姓名信息状态"]
         self.records_table.setColumnCount(len(headers))
         self.records_table.setHorizontalHeaderLabels(headers)
         self.records_table.setRowCount(len(self.records_data))
         
         for row, record in enumerate(self.records_data):
-            record_id, legal_name, create_time, update_time, company_address_other, company_information = record
+            record_id, legal_name, create_time, update_time, address_information, name_information = record
             
             # 选择框
             checkbox = QCheckBox()
@@ -394,13 +450,13 @@ class CustomerInfoCompleteWidget(QWidget):
             self.records_table.setItem(row, 3, QTableWidgetItem(create_time_str))
             self.records_table.setItem(row, 4, QTableWidgetItem(update_time_str))
             
-            # 公司地址信息状态
-            address_status = "已有内容" if company_address_other and company_address_other.strip() else "空白"
+            # 住所信息状态
+            address_status = "已有内容" if address_information and address_information.strip() else "空白"
             self.records_table.setItem(row, 5, QTableWidgetItem(address_status))
             
-            # 公司信息状态
-            company_status = "已有内容" if company_information and company_information.strip() else "空白"
-            self.records_table.setItem(row, 6, QTableWidgetItem(company_status))
+            # 姓名信息状态
+            name_status = "已有内容" if name_information and name_information.strip() else "空白"
+            self.records_table.setItem(row, 6, QTableWidgetItem(name_status))
         
         # 调整列宽
         self.records_table.resizeColumnsToContents()
@@ -440,9 +496,10 @@ class CustomerInfoCompleteWidget(QWidget):
         
         self.select_all_btn.setEnabled(has_records)
         self.deselect_all_btn.setEnabled(has_records)
-        self.start_btn.setEnabled(has_selection)
+        self.start_address_btn.setEnabled(has_selection)
+        self.start_name_btn.setEnabled(has_selection)
     
-    def start_update(self):
+    def start_update(self, fill_mode='address_info'):
         """开始补全"""
         datasource = self.datasource_combo.currentData()
         if not datasource:
@@ -454,13 +511,22 @@ class CustomerInfoCompleteWidget(QWidget):
             QMessageBox.warning(self, "警告", "请先选择要补全的记录！")
             return
         
+        # 根据模式确定提示信息
+        if fill_mode == 'address_info':
+            field_name = "address_information"
+            template_desc = "住所信息模板（本人住所等）"
+        else:
+            field_name = "name_information"
+            template_desc = "姓名信息模板（名前等）"
+        
         # 确认对话框
         reply = QMessageBox.question(
             self,
             "确认补全",
             f"确定要补全选中的 {len(selected_ids)} 条记录吗？\n\n"
-            f"将为这些记录的company_address_other和company_information字段\n"
-            f"补充标准的公司信息模板。",
+            f"将为这些记录的 {field_name} 字段\n"
+            f"补充{template_desc}。\n\n"
+            f"已有内容的记录会跳过，不会覆盖。",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
@@ -469,15 +535,16 @@ class CustomerInfoCompleteWidget(QWidget):
             return
         
         # 禁用按钮，显示进度条
-        self.start_btn.setEnabled(False)
+        self.start_address_btn.setEnabled(False)
+        self.start_name_btn.setEnabled(False)
         self.query_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self.result_label.setText("正在补全中...")
+        self.result_label.setText(f"正在补全 {field_name} 中...")
         self.log_text.clear()
         
         # 启动工作线程
-        self.worker = CustomerInfoCompleteWorker(datasource, self.db_manager, selected_ids)
+        self.worker = CustomerInfoCompleteWorker(datasource, self.db_manager, selected_ids, fill_mode)
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log_message.connect(self.append_log)
         self.worker.finished.connect(self.on_update_finished)
@@ -491,14 +558,17 @@ class CustomerInfoCompleteWidget(QWidget):
     
     def on_update_finished(self, results):
         """补全完成"""
-        self.start_btn.setEnabled(True)
+        self.start_address_btn.setEnabled(True)
+        self.start_name_btn.setEnabled(True)
         self.query_btn.setEnabled(True)
         self.progress_bar.setVisible(False)
         
+        skipped = results.get('skipped', 0)
         result_text = (
             f"补全完成！\n"
             f"总计：{results['total']} 条\n"
             f"成功：{results['success']} 条\n"
+            f"跳过（已有内容）：{skipped} 条\n"
             f"失败：{results['failed']} 条"
         )
         
@@ -521,7 +591,8 @@ class CustomerInfoCompleteWidget(QWidget):
     
     def on_update_error(self, error_msg):
         """补全错误"""
-        self.start_btn.setEnabled(True)
+        self.start_address_btn.setEnabled(True)
+        self.start_name_btn.setEnabled(True)
         self.query_btn.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.result_label.setText("补全失败！")

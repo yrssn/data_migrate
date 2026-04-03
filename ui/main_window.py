@@ -39,6 +39,11 @@ from .platform_info_preprocess_widget import PlatformInfoPreprocessWidget
 from .extract_by_column_widget import ExtractByColumnWidget
 from .platform_exist_precheck_widget import PlatformExistPrecheckWidget
 from .inventory_bank_fill_widget import InventoryBankFillWidget
+from .restore_opt1_shopindex_widget import RestoreOpt1ShopindexWidget
+from .restore_inventory_shopindex_widget import RestoreInventoryShopindexWidget
+from .excel_compare_v2_widget import ExcelCompareV2Widget
+from .sync_inventory_v2_widget import SyncInventoryV2Widget
+from .ptzcb_duplicate_check_widget import PtzcbDuplicateCheckWidget
 
 
 class MainWindow(QMainWindow):
@@ -387,6 +392,11 @@ class MainWindow(QMainWindow):
         self.function_combo2.addItem("去除平台重复数据", "extract_by_column")
         self.function_combo2.addItem("平台存在预检测", "platform_exist_precheck")
         self.function_combo2.addItem("根据库存ID补全银行卡", "inventory_bank_fill")
+        self.function_combo2.addItem("恢复个人事业主主体编号", "restore_opt1_shopindex")
+        self.function_combo2.addItem("恢复库存的主体编号", "restore_inventory_shopindex")
+        self.function_combo2.addItem("对比表格数据导出2.0", "excel_compare_v2")
+        self.function_combo2.addItem("同步库存账号V2", "sync_inventory_v2")
+        self.function_combo2.addItem("注册表重复数据检查", "ptzcb_duplicate_check")
         self.function_combo2.currentTextChanged.connect(self.on_function_changed2)
         function_layout.addWidget(self.function_combo2)
 
@@ -415,6 +425,26 @@ class MainWindow(QMainWindow):
         self.inventory_bank_fill_widget = InventoryBankFillWidget(self.db_manager)
         self.function_stack2.addWidget(self.inventory_bank_fill_widget)
 
+        self.restore_opt1_shopindex_widget = RestoreOpt1ShopindexWidget(self.db_manager)
+        self.function_stack2.addWidget(self.restore_opt1_shopindex_widget)
+
+        self.restore_inventory_shopindex_widget = RestoreInventoryShopindexWidget(
+            self.db_manager
+        )
+        self.function_stack2.addWidget(self.restore_inventory_shopindex_widget)
+
+        # 对比表格数据导出2.0
+        self.excel_compare_v2_widget = ExcelCompareV2Widget()
+        self.function_stack2.addWidget(self.excel_compare_v2_widget)
+
+        # 同步库存账号V2
+        self.sync_inventory_v2_widget = SyncInventoryV2Widget(self.db_manager)
+        self.function_stack2.addWidget(self.sync_inventory_v2_widget)
+
+        # 注册表重复数据检查
+        self.ptzcb_duplicate_check_widget = PtzcbDuplicateCheckWidget(self.db_manager)
+        self.function_stack2.addWidget(self.ptzcb_duplicate_check_widget)
+
         # 占位页面（其他功能）
         placeholder_widget = QWidget()
         placeholder_layout = QVBoxLayout()
@@ -442,8 +472,18 @@ class MainWindow(QMainWindow):
             self.function_stack2.setCurrentIndex(3)
         elif "根据库存ID补全银行卡" in text:
             self.function_stack2.setCurrentIndex(4)
-        else:
+        elif "恢复个人事业主主体编号" in text:
             self.function_stack2.setCurrentIndex(5)
+        elif "恢复库存的主体编号" in text:
+            self.function_stack2.setCurrentIndex(6)
+        elif "对比表格数据导出2.0" in text:
+            self.function_stack2.setCurrentIndex(7)
+        elif "同步库存账号V2" in text:
+            self.function_stack2.setCurrentIndex(8)
+        elif "注册表重复数据检查" in text:
+            self.function_stack2.setCurrentIndex(9)
+        else:
+            self.function_stack2.setCurrentIndex(10)
     
     def load_datasources(self):
         """加载数据源列表"""
