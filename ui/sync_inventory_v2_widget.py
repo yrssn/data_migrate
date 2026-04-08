@@ -15,6 +15,39 @@ from PyQt5.QtGui import QFont
 from database import DatabaseManager
 import pandas as pd
 import pymysql
+import openpyxl
+
+
+
+def _safe_read_excel(filepath, **kwargs):
+    """安全读取Excel，绕过openpyxl的AutoFilter解析bug
+    通过zipfile直接修改xlsx内部XML，移除autoFilter节点"""
+    import tempfile
+    import zipfile
+    import re
+
+    tmp = tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+
+    with zipfile.ZipFile(filepath, 'r') as zin:
+        with zipfile.ZipFile(tmp_path, 'w') as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename.startswith('xl/worksheets/') and item.filename.endswith('.xml'):
+                    content = data.decode('utf-8')
+                    content = re.sub(r'<autoFilter[^/]*/>',  '', content)
+                    content = re.sub(r'<autoFilter[^>]*>.*?</autoFilter>', '', content, flags=re.DOTALL)
+                    data = content.encode('utf-8')
+                zout.writestr(item, data)
+    try:
+        df = pd.read_excel(tmp_path, engine='openpyxl', **kwargs)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except:
+            pass
+    return df
 
 
 class SyncInventoryV2Worker(QThread):
@@ -25,7 +58,8 @@ class SyncInventoryV2Worker(QThread):
     error = pyqtSignal(str)
 
     def __init__(self, datasource, excel_file, ptzcb_column, bank_card_column,
-                 status_column, status_mapping, register_department):
+                 status_column, status_mapping, register_department,
+                 filter_column=None, match_column=None, match_values=None):
         super().__init__()
         self.datasource = datasource
         self.excel_file = excel_file
@@ -34,6 +68,9 @@ class SyncInventoryV2Worker(QThread):
         self.status_column = status_column
         self.status_mapping = status_mapping  # {excel_value: status_code}
         self.register_department = register_department
+        self.filter_column = filter_column  # 过滤列：有值的行跳过
+        self.match_column = match_column      # 匹配列：只保留匹配的行
+        self.match_values = match_values or []  # 匹配值列表
         self.results = {
             'total_rows': 0,
             'success_count': 0,
@@ -48,7 +85,10 @@ class SyncInventoryV2Worker(QThread):
             self.log_message.emit("开始读取Excel文件...")
             self.progress.emit(5)
 
-            df = pd.read_excel(self.excel_file, engine='openpyxl')
+            try:
+                df = pd.read_excel(self.excel_file, engine='openpyxl')
+            except Exception:
+                df = _safe_read_excel(self.excel_file)
             self.log_message.emit(f"成功读取Excel文件，共 {len(df)} 行数据")
             self.results['total_rows'] = len(df)
             self.progress.emit(10)
@@ -65,8 +105,35 @@ class SyncInventoryV2Worker(QThread):
             self.log_message.emit("数据库连接成功")
             self.progress.emit(15)
 
+            skipped_count = 0
             for index, row in df.iterrows():
                 try:
+                    # 匹配过滤：只处理匹配列值在允许列表中的行
+                    if self.match_column and self.match_values and self.match_column in row.index:
+                        row_val = str(row[self.match_column]).strip()
+                        if row_val not in self.match_values:
+                            skipped_count += 1
+                            completed_row = row.to_dict()
+                            completed_row['处理状态'] = '跳过(不匹配)'
+                            completed_row['处理时间'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            self.results['completed_data'].append(completed_row)
+                            progress = 15 + int((index + 1) / len(df) * 80)
+                            self.progress.emit(progress)
+                            continue
+
+                    # 过滤：如果过滤列有值则跳过
+                    if self.filter_column and self.filter_column in row.index:
+                        filter_val = str(row[self.filter_column]).strip()
+                        if filter_val and filter_val != '' and filter_val != 'nan' and filter_val != 'None':
+                            skipped_count += 1
+                            completed_row = row.to_dict()
+                            completed_row['处理状态'] = '跳过(已有值)'
+                            completed_row['处理时间'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            self.results['completed_data'].append(completed_row)
+                            progress = 15 + int((index + 1) / len(df) * 80)
+                            self.progress.emit(progress)
+                            continue
+
                     inventory_num, account_mag_id = self.process_row(cursor, index + 1, row)
                     self.results['success_count'] += 1
 
@@ -107,6 +174,9 @@ class SyncInventoryV2Worker(QThread):
             cursor.close()
             connection.close()
 
+            if skipped_count > 0:
+                self.log_message.emit(f"共跳过 {skipped_count} 行（过滤列已有值）")
+            self.results['skipped_count'] = skipped_count
             self.progress.emit(100)
             self.finished.emit(self.results)
 
@@ -205,7 +275,7 @@ class SyncInventoryV2Worker(QThread):
             return None
         cursor.execute("""
             SELECT id FROM ba_zhb_bank
-            WHERE bank_card_number = %s
+            WHERE bank_id = %s
             ORDER BY update_time DESC
             LIMIT 1
         """, (bank_card_no,))
@@ -305,6 +375,20 @@ class SyncInventoryV2Widget(QWidget):
         self.bank_card_column_combo = QComboBox()
         self.bank_card_column_combo.setEnabled(False)
         col_layout.addRow("银行卡号列:", self.bank_card_column_combo)
+
+        self.filter_column_combo = QComboBox()
+        self.filter_column_combo.setEnabled(False)
+        col_layout.addRow("过滤列(有值跳过):", self.filter_column_combo)
+
+        self.match_column_combo = QComboBox()
+        self.match_column_combo.setEnabled(False)
+        self.match_column_combo.currentTextChanged.connect(self.on_match_column_changed)
+        col_layout.addRow("匹配列(只保留匹配):", self.match_column_combo)
+
+        self.match_values_edit = QLineEdit()
+        self.match_values_edit.setEnabled(False)
+        self.match_values_edit.setPlaceholderText("输入要保留的值，多个用逗号分隔，如: 完成,进行中")
+        col_layout.addRow("匹配值:", self.match_values_edit)
 
         status_col_row = QHBoxLayout()
         self.status_column_combo = QComboBox()
@@ -422,7 +506,10 @@ class SyncInventoryV2Widget(QWidget):
         if not path:
             return
         try:
-            df = pd.read_excel(path, engine='openpyxl', nrows=0)
+            try:
+                df = pd.read_excel(path, engine='openpyxl', nrows=0)
+            except Exception:
+                df = _safe_read_excel(path, nrows=0)
             self.excel_columns = list(df.columns)
             self.excel_file = path
             self.file_label.setText(os.path.basename(path))
@@ -434,6 +521,18 @@ class SyncInventoryV2Widget(QWidget):
                 combo.addItems([str(c) for c in self.excel_columns])
                 combo.setEnabled(True)
 
+            self.filter_column_combo.clear()
+            self.filter_column_combo.addItem("不过滤")
+            self.filter_column_combo.addItems([str(c) for c in self.excel_columns])
+            self.filter_column_combo.setEnabled(True)
+
+            self.match_column_combo.clear()
+            self.match_column_combo.addItem("不匹配")
+            self.match_column_combo.addItems([str(c) for c in self.excel_columns])
+            self.match_column_combo.setEnabled(True)
+            self.match_values_edit.setEnabled(False)
+            self.match_values_edit.clear()
+
             self.load_status_btn.setEnabled(False)
             self.status_table.setRowCount(0)
             self.append_log(f"读取Excel表头，共 {len(self.excel_columns)} 列")
@@ -443,6 +542,13 @@ class SyncInventoryV2Widget(QWidget):
             self.excel_file = None
             self.file_label.setText("未选择文件")
             self.file_label.setStyleSheet("color: gray;")
+
+    # === 匹配过滤 ===
+    def on_match_column_changed(self, text):
+        enabled = text != "不匹配" and text != ""
+        self.match_values_edit.setEnabled(enabled)
+        if not enabled:
+            self.match_values_edit.clear()
 
     # === 状态映射 ===
     def on_status_column_changed(self, text):
@@ -454,9 +560,13 @@ class SyncInventoryV2Widget(QWidget):
         if col == "请选择列" or not self.excel_file:
             return
         try:
-            df = pd.read_excel(self.excel_file, engine='openpyxl', usecols=[col])
-            unique_vals = df[col].dropna().astype(str).str.strip().unique()
-            unique_vals = sorted(set(v for v in unique_vals if v and v != 'nan'))
+            df = _safe_read_excel(self.excel_file, dtype=str)
+            if col not in df.columns:
+                QMessageBox.warning(self, "错误", f"列 '{col}' 不存在")
+                return
+            series = df[col].fillna('').astype(str).str.strip()
+            unique_vals = [v for v in series.unique() if v and v != 'nan' and v != 'None']
+            unique_vals = sorted(set(unique_vals))
             self.status_unique_values = unique_vals
 
             self.status_table.setRowCount(len(unique_vals))
@@ -507,6 +617,12 @@ class SyncInventoryV2Widget(QWidget):
         bank_card_col = self.bank_card_column_combo.currentText()
         status_col = self.status_column_combo.currentText()
         dept = self.register_dept_edit.text().strip()
+        filter_col_text = self.filter_column_combo.currentText()
+        filter_col = filter_col_text if filter_col_text != "不过滤" else None
+        match_col_text = self.match_column_combo.currentText()
+        match_col = match_col_text if match_col_text != "不匹配" else None
+        match_vals_text = self.match_values_edit.text().strip()
+        match_vals = [v.strip() for v in match_vals_text.split(',') if v.strip()] if match_col and match_vals_text else []
 
         if ptzcb_col == "请选择列" or bank_card_col == "请选择列" or status_col == "请选择列":
             QMessageBox.warning(self, "警告", "请选择所有必要的列！")
@@ -526,6 +642,9 @@ class SyncInventoryV2Widget(QWidget):
             f"PTZCB列: {ptzcb_col}\n"
             f"银行卡号列: {bank_card_col}\n"
             f"状态列: {status_col}\n"
+            f"过滤列: {filter_col_text}\n"
+            f"匹配列: {match_col_text}\n"
+            f"匹配值: {match_vals_text if match_vals_text else '无'}\n"
             f"注册部门: {dept}\n\n"
             f"状态映射:\n{mapping_desc}\n\n"
             f"操作不可撤销，请确认！",
@@ -546,7 +665,8 @@ class SyncInventoryV2Widget(QWidget):
 
         self.worker = SyncInventoryV2Worker(
             ds, self.excel_file, ptzcb_col, bank_card_col,
-            status_col, status_mapping, dept
+            status_col, status_mapping, dept,
+            filter_column=filter_col, match_column=match_col, match_values=match_vals
         )
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log_message.connect(self.append_log)
@@ -568,7 +688,8 @@ class SyncInventoryV2Widget(QWidget):
         s = results['success_count']
         f = results['failed_count']
         t = results['total_rows']
-        text = f"同步完成！成功: {s}, 失败: {f}, 总计: {t}"
+        sk = results.get('skipped_count', 0)
+        text = f"同步完成！成功: {s}, 失败: {f}, 跳过: {sk}, 总计: {t}"
         self.result_label.setText(text)
         self.result_label.setStyleSheet("color: green;" if f == 0 else "color: orange;")
 

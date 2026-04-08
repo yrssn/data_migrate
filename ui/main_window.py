@@ -44,6 +44,9 @@ from .restore_inventory_shopindex_widget import RestoreInventoryShopindexWidget
 from .excel_compare_v2_widget import ExcelCompareV2Widget
 from .sync_inventory_v2_widget import SyncInventoryV2Widget
 from .ptzcb_duplicate_check_widget import PtzcbDuplicateCheckWidget
+from .account_mag_duplicate_check_widget import AccountMagDuplicateCheckWidget
+from .dy_shop_fill_widget import DyShopFillWidget
+from .sync_inventory_to_finance_widget import SyncInventoryToFinanceWidget
 
 
 class MainWindow(QMainWindow):
@@ -397,6 +400,9 @@ class MainWindow(QMainWindow):
         self.function_combo2.addItem("对比表格数据导出2.0", "excel_compare_v2")
         self.function_combo2.addItem("同步库存账号V2", "sync_inventory_v2")
         self.function_combo2.addItem("注册表重复数据检查", "ptzcb_duplicate_check")
+        self.function_combo2.addItem("库存表重复数据检查", "account_mag_duplicate_check")
+        self.function_combo2.addItem("抖店库存编号填充", "dy_shop_fill")
+        self.function_combo2.addItem("同步库存编号到财务系统", "sync_inventory_to_finance")
         self.function_combo2.currentTextChanged.connect(self.on_function_changed2)
         function_layout.addWidget(self.function_combo2)
 
@@ -445,6 +451,18 @@ class MainWindow(QMainWindow):
         self.ptzcb_duplicate_check_widget = PtzcbDuplicateCheckWidget(self.db_manager)
         self.function_stack2.addWidget(self.ptzcb_duplicate_check_widget)
 
+        # 库存表重复数据检查
+        self.account_mag_duplicate_check_widget = AccountMagDuplicateCheckWidget()
+        self.function_stack2.addWidget(self.account_mag_duplicate_check_widget)
+
+        # 抖店库存编号填充
+        self.dy_shop_fill_widget = DyShopFillWidget(self.db_manager)
+        self.function_stack2.addWidget(self.dy_shop_fill_widget)
+
+        # 同步库存编号到财务系统
+        self.sync_inventory_to_finance_widget = SyncInventoryToFinanceWidget(self.db_manager)
+        self.function_stack2.addWidget(self.sync_inventory_to_finance_widget)
+
         # 占位页面（其他功能）
         placeholder_widget = QWidget()
         placeholder_layout = QVBoxLayout()
@@ -482,8 +500,14 @@ class MainWindow(QMainWindow):
             self.function_stack2.setCurrentIndex(8)
         elif "注册表重复数据检查" in text:
             self.function_stack2.setCurrentIndex(9)
-        else:
+        elif "库存表重复数据检查" in text:
             self.function_stack2.setCurrentIndex(10)
+        elif "抖店库存编号填充" in text:
+            self.function_stack2.setCurrentIndex(11)
+        elif "同步库存编号到财务系统" in text:
+            self.function_stack2.setCurrentIndex(12)
+        else:
+            self.function_stack2.setCurrentIndex(13)
     
     def load_datasources(self):
         """加载数据源列表"""
