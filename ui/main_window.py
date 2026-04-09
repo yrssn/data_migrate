@@ -47,6 +47,8 @@ from .ptzcb_duplicate_check_widget import PtzcbDuplicateCheckWidget
 from .account_mag_duplicate_check_widget import AccountMagDuplicateCheckWidget
 from .dy_shop_fill_widget import DyShopFillWidget
 from .sync_inventory_to_finance_widget import SyncInventoryToFinanceWidget
+from .register_attr_duplicate_check_widget import RegisterAttrDuplicateCheckWidget
+from .register_fill_from_order_widget import RegisterFillFromOrderWidget
 
 
 class MainWindow(QMainWindow):
@@ -403,6 +405,8 @@ class MainWindow(QMainWindow):
         self.function_combo2.addItem("库存表重复数据检查", "account_mag_duplicate_check")
         self.function_combo2.addItem("抖店库存编号填充", "dy_shop_fill")
         self.function_combo2.addItem("同步库存编号到财务系统", "sync_inventory_to_finance")
+        self.function_combo2.addItem("注册表属性相同检测", "register_attr_duplicate_check")
+        self.function_combo2.addItem("注册表补充平台和属地ID", "register_fill_from_order")
         self.function_combo2.currentTextChanged.connect(self.on_function_changed2)
         function_layout.addWidget(self.function_combo2)
 
@@ -463,6 +467,14 @@ class MainWindow(QMainWindow):
         self.sync_inventory_to_finance_widget = SyncInventoryToFinanceWidget(self.db_manager)
         self.function_stack2.addWidget(self.sync_inventory_to_finance_widget)
 
+        # 注册表属性相同检测
+        self.register_attr_duplicate_check_widget = RegisterAttrDuplicateCheckWidget(self.db_manager)
+        self.function_stack2.addWidget(self.register_attr_duplicate_check_widget)
+
+        # 注册表补充平台和属地ID
+        self.register_fill_from_order_widget = RegisterFillFromOrderWidget(self.db_manager)
+        self.function_stack2.addWidget(self.register_fill_from_order_widget)
+
         # 占位页面（其他功能）
         placeholder_widget = QWidget()
         placeholder_layout = QVBoxLayout()
@@ -506,8 +518,12 @@ class MainWindow(QMainWindow):
             self.function_stack2.setCurrentIndex(11)
         elif "同步库存编号到财务系统" in text:
             self.function_stack2.setCurrentIndex(12)
-        else:
+        elif "注册表属性相同检测" in text:
             self.function_stack2.setCurrentIndex(13)
+        elif "注册表补充平台和属地ID" in text:
+            self.function_stack2.setCurrentIndex(14)
+        else:
+            self.function_stack2.setCurrentIndex(15)
     
     def load_datasources(self):
         """加载数据源列表"""
