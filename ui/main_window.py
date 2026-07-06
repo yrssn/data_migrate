@@ -50,6 +50,7 @@ from .sync_inventory_to_finance_widget import SyncInventoryToFinanceWidget
 from .register_attr_duplicate_check_widget import RegisterAttrDuplicateCheckWidget
 from .register_fill_from_order_widget import RegisterFillFromOrderWidget
 from .json_field_extract_widget import JsonFieldExtractWidget
+from .ptzcb_bank_export_widget import PtzcbBankExportWidget
 from .soft_delete_widget import SoftDeleteWidget
 
 
@@ -411,6 +412,7 @@ class MainWindow(QMainWindow):
         self.function_combo2.addItem("注册表补充平台和属地ID", "register_fill_from_order")
         self.function_combo2.addItem("JSON字段元素提取删除", "json_field_extract")
         self.function_combo2.addItem("软删除工具", "soft_delete")
+        self.function_combo2.addItem("注册表银行数据导出", "ptzcb_bank_export")
         self.function_combo2.currentTextChanged.connect(self.on_function_changed2)
         function_layout.addWidget(self.function_combo2)
 
@@ -487,6 +489,10 @@ class MainWindow(QMainWindow):
         self.soft_delete_widget = SoftDeleteWidget(self.db_manager)
         self.function_stack2.addWidget(self.soft_delete_widget)
 
+        # 注册表银行数据导出
+        self.ptzcb_bank_export_widget = PtzcbBankExportWidget(self.db_manager)
+        self.function_stack2.addWidget(self.ptzcb_bank_export_widget)
+
         # 占位页面（其他功能）
         placeholder_widget = QWidget()
         placeholder_layout = QVBoxLayout()
@@ -538,8 +544,10 @@ class MainWindow(QMainWindow):
             self.function_stack2.setCurrentIndex(15)
         elif "软删除工具" in text:
             self.function_stack2.setCurrentIndex(16)
-        else:
+        elif "注册表银行数据导出" in text:
             self.function_stack2.setCurrentIndex(17)
+        else:
+            self.function_stack2.setCurrentIndex(18)
     
     def load_datasources(self):
         """加载数据源列表"""
