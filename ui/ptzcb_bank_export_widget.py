@@ -19,6 +19,10 @@ import pandas as pd
 import pymysql
 
 
+BANK_CARD_TYPE_MAP = {'opt0': '个人卡', 'opt1': '企业卡', 'opt2': '第三方卡'}
+ATTRIBUTE_MAP = {'opt0': '个人', 'opt1': '个人事业主', 'opt2': '企业法人'}
+
+
 class BankExportWorker(QThread):
     """银行数据导出工作线程"""
     progress = pyqtSignal(int)
@@ -48,16 +52,34 @@ class BankExportWorker(QThread):
             self.log_message.emit("数据库连接成功")
             self.progress.emit(20)
 
+            # 检测 ba_currency 的币种名称字段
+            cursor.execute("SHOW COLUMNS FROM ba_currency")
+            currency_cols = [c['Field'] for c in cursor.fetchall()]
+            currency_name_col = next(
+                (c for c in ('name', 'currency', 'currency_name', 'code', 'title')
+                 if c in currency_cols),
+                currency_cols[0]
+            )
+
             self.log_message.emit("正在查询数据 (status=6 且平台类型为 opt1=银行)...")
 
-            sql = """
+            sql = f"""
                 SELECT
-                    r.*,
+                    r.id,
+                    r.project_id,
+                    r.customer_id,
+                    r.order_id,
+                    r.currency_id,
+                    r.bank_card_type,
                     p.platform AS 银行名称,
-                    c.legal_name AS 法人姓名
+                    c.legal_name AS 法人姓名,
+                    cur.`{currency_name_col}` AS 币种,
+                    o.attribute AS 订单属性
                 FROM ba_ptzcb_register r
                 INNER JOIN ba_platform p ON r.platform_id = p.id
                 LEFT JOIN ba_rlb_customer c ON r.customer_id = c.id
+                LEFT JOIN ba_currency cur ON r.currency_id = cur.id
+                LEFT JOIN ba_order o ON r.order_id = o.id
                 WHERE r.status = 6
                   AND p.platform_type = 'opt1'
                   AND (r.delete_time IS NULL OR r.delete_time = 0)
@@ -65,7 +87,23 @@ class BankExportWorker(QThread):
             """
 
             cursor.execute(sql)
-            rows = cursor.fetchall()
+            raw_rows = cursor.fetchall()
+
+            rows = []
+            for row in raw_rows:
+                bank_card_type = row.get('bank_card_type')
+                attribute = row.get('订单属性')
+                rows.append({
+                    '注册表ID': row['id'],
+                    '项目编号': row.get('project_id'),
+                    'customer_id': row.get('customer_id'),
+                    '银行名称': row.get('银行名称'),
+                    '法人姓名': row.get('法人姓名'),
+                    '银行卡类型': BANK_CARD_TYPE_MAP.get(bank_card_type, bank_card_type),
+                    '币种': row.get('币种'),
+                    '订单ID': row.get('order_id'),
+                    '订单属性': ATTRIBUTE_MAP.get(attribute, attribute),
+                })
             self.progress.emit(50)
 
             if not rows:
@@ -157,8 +195,10 @@ class PtzcbBankExportWidget(QWidget):
         info_layout = QVBoxLayout()
         info_label = QLabel(
             "导出 ba_ptzcb_register 表中 status=6 且 platform_id 对应 "
-            "ba_platform.platform_type='opt1'（银行）的数据，"
-            "关联银行名称（ba_platform.platform）和法人姓名（ba_rlb_customer.legal_name）。\n"
+            "ba_platform.platform_type='opt1'（银行）的数据。\n"
+            "导出字段：项目编号、银行名称（ba_platform.platform）、法人姓名（ba_rlb_customer）、"
+            "银行卡类型（opt0-个人卡/opt1-企业卡/opt2-第三方卡）、"
+            "币种（ba_currency）、订单ID及订单属性（ba_order，opt0=个人/opt1=个人事业主/opt2=企业法人）。\n"
             "再与 ba_zhb_bank 匹配：bank_name_id 对应的 ba_zhb_bank_name.bank_name 等于银行名称，"
             "且 rlb_customer_id 等于 customer_id。\n"
             "导出Excel包含三个sheet：匹配上、匹配不上、原始数据。"
