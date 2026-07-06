@@ -3,7 +3,10 @@
 导出 ba_ptzcb_register 表中 status=6 且 platform_id 对应
 ba_platform.platform_type='opt1'（银行）的数据，
 关联 ba_platform.platform 作为银行名称、
-customer_id 关联 ba_rlb_customer.legal_name 法人姓名，导出Excel
+customer_id 关联 ba_rlb_customer.legal_name 法人姓名，
+并与 ba_zhb_bank 匹配（bank_name_id 对应的 ba_zhb_bank_name.bank_name = ba_platform.platform
+且 rlb_customer_id = customer_id），
+匹配上、匹配不上、原始数据分三个sheet导出Excel
 """
 from datetime import datetime
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
@@ -63,26 +66,73 @@ class BankExportWorker(QThread):
 
             cursor.execute(sql)
             rows = cursor.fetchall()
-            cursor.close()
-            connection.close()
-            self.progress.emit(60)
+            self.progress.emit(50)
 
             if not rows:
+                cursor.close()
+                connection.close()
                 self.log_message.emit("没有找到符合条件的数据")
                 self.progress.emit(100)
-                self.finished.emit({'total_records': 0})
+                self.finished.emit({'total_records': 0, 'matched': 0, 'unmatched': 0})
                 return
 
-            self.log_message.emit(f"查询到 {len(rows)} 条记录")
+            self.log_message.emit(f"查询到 {len(rows)} 条原始记录")
+            self.log_message.emit("正在与 ba_zhb_bank 匹配...")
 
-            df = pd.DataFrame(rows)
-            self.progress.emit(80)
+            match_sql = """
+                SELECT b.id AS 银行卡记录ID,
+                       b.bank_id AS 银行卡号,
+                       bn.bank_name AS 匹配银行名称
+                FROM ba_zhb_bank b
+                INNER JOIN ba_zhb_bank_name bn ON b.bank_name_id = bn.id
+                WHERE b.rlb_customer_id = %s
+                  AND bn.bank_name = %s
+                  AND (b.delete_time IS NULL OR b.delete_time = 0)
+                ORDER BY b.update_time DESC
+                LIMIT 1
+            """
 
-            df.to_excel(self.output_file, index=False, engine='openpyxl')
+            matched_rows = []
+            unmatched_rows = []
+            for i, row in enumerate(rows):
+                bank = None
+                if row.get('customer_id'):
+                    cursor.execute(match_sql, (row['customer_id'], row['银行名称']))
+                    bank = cursor.fetchone()
+                if bank:
+                    matched = dict(row)
+                    matched.update(bank)
+                    matched_rows.append(matched)
+                else:
+                    unmatched_rows.append(row)
+                if (i + 1) % 50 == 0:
+                    self.progress.emit(50 + int((i + 1) / len(rows) * 30))
+
+            cursor.close()
+            connection.close()
+
+            self.log_message.emit(
+                f"匹配上 {len(matched_rows)} 条，匹配不上 {len(unmatched_rows)} 条"
+            )
+            self.progress.emit(85)
+
+            df_all = pd.DataFrame(rows)
+            df_matched = pd.DataFrame(matched_rows)
+            df_unmatched = pd.DataFrame(unmatched_rows)
+
+            with pd.ExcelWriter(self.output_file, engine='openpyxl') as writer:
+                df_matched.to_excel(writer, sheet_name='匹配上', index=False)
+                df_unmatched.to_excel(writer, sheet_name='匹配不上', index=False)
+                df_all.to_excel(writer, sheet_name='原始数据', index=False)
+
             self.log_message.emit(f"已导出到: {self.output_file}")
             self.progress.emit(100)
 
-            self.finished.emit({'total_records': len(df)})
+            self.finished.emit({
+                'total_records': len(rows),
+                'matched': len(matched_rows),
+                'unmatched': len(unmatched_rows)
+            })
 
         except Exception as e:
             self.error.emit(f"处理出错: {str(e)}")
@@ -107,9 +157,11 @@ class PtzcbBankExportWidget(QWidget):
         info_layout = QVBoxLayout()
         info_label = QLabel(
             "导出 ba_ptzcb_register 表中 status=6 且 platform_id 对应 "
-            "ba_platform.platform_type='opt1'（银行）的数据。\n"
-            "同时关联查出银行名称（ba_platform.platform）和 "
-            "customer_id 关联的法人姓名（ba_rlb_customer.legal_name），导出到Excel。"
+            "ba_platform.platform_type='opt1'（银行）的数据，"
+            "关联银行名称（ba_platform.platform）和法人姓名（ba_rlb_customer.legal_name）。\n"
+            "再与 ba_zhb_bank 匹配：bank_name_id 对应的 ba_zhb_bank_name.bank_name 等于银行名称，"
+            "且 rlb_customer_id 等于 customer_id。\n"
+            "导出Excel包含三个sheet：匹配上、匹配不上、原始数据。"
         )
         info_label.setWordWrap(True)
         info_layout.addWidget(info_label)
@@ -246,13 +298,17 @@ class PtzcbBankExportWidget(QWidget):
 
     def _on_finished(self, results):
         total = results['total_records']
+        matched = results.get('matched', 0)
+        unmatched = results.get('unmatched', 0)
         if total == 0:
             self.result_label.setText("没有找到符合条件的数据")
             self.result_label.setStyleSheet("color: orange;")
         else:
-            self.result_label.setText(f"共 {total} 条记录，已导出")
+            self.result_label.setText(
+                f"共 {total} 条，匹配上 {matched} 条，匹配不上 {unmatched} 条，已导出"
+            )
             self.result_label.setStyleSheet("color: green;")
-        self._log(f"导出完成！共 {total} 条")
+        self._log(f"导出完成！共 {total} 条，匹配上 {matched} 条，匹配不上 {unmatched} 条")
         self._reset_ui()
 
     def _on_error(self, msg):
