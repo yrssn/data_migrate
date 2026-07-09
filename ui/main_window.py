@@ -91,6 +91,10 @@ class MainWindow(QMainWindow):
         migration_tab2 = self.create_migration_tab2()
         self.tab_widget.addTab(migration_tab2, "迁移任务2")
         
+        # 迁移任务3标签页
+        migration_tab3 = self.create_migration_tab3()
+        self.tab_widget.addTab(migration_tab3, "迁移任务3")
+        
         main_layout.addWidget(self.tab_widget)
         
         central_widget.setLayout(main_layout)
@@ -416,7 +420,6 @@ class MainWindow(QMainWindow):
         self.function_combo2.addItem("软删除工具", "soft_delete")
         self.function_combo2.addItem("注册表银行数据导出", "ptzcb_bank_export")
         self.function_combo2.addItem("银行表补充注册表ID", "zhb_bank_register_fill")
-        self.function_combo2.addItem("图片丢失检查", "image_missing_check")
         self.function_combo2.currentTextChanged.connect(self.on_function_changed2)
         function_layout.addWidget(self.function_combo2)
 
@@ -501,9 +504,6 @@ class MainWindow(QMainWindow):
         self.zhb_bank_register_fill_widget = ZhbBankRegisterFillWidget(self.db_manager)
         self.function_stack2.addWidget(self.zhb_bank_register_fill_widget)
 
-        # 图片丢失检查
-        self.image_missing_check_widget = ImageMissingCheckWidget(self.db_manager)
-        self.function_stack2.addWidget(self.image_missing_check_widget)
 
         # 占位页面（其他功能）
         placeholder_widget = QWidget()
@@ -560,10 +560,58 @@ class MainWindow(QMainWindow):
             self.function_stack2.setCurrentIndex(17)
         elif "银行表补充注册表ID" in text:
             self.function_stack2.setCurrentIndex(18)
-        elif "图片丢失检查" in text:
-            self.function_stack2.setCurrentIndex(19)
         else:
-            self.function_stack2.setCurrentIndex(20)
+            self.function_stack2.setCurrentIndex(19)
+
+    def create_migration_tab3(self) -> QWidget:
+        """创建迁移任务3标签页"""
+        widget = QWidget()
+        layout = QVBoxLayout()
+
+        # 功能选择区域
+        function_group = QGroupBox("选择迁移功能")
+        function_layout = QHBoxLayout()
+
+        function_label = QLabel("功能类型:")
+        function_layout.addWidget(function_label)
+
+        self.function_combo3 = QComboBox()
+        self.function_combo3.addItem("图片丢失检查", "image_missing_check")
+        self.function_combo3.currentTextChanged.connect(self.on_function_changed3)
+        function_layout.addWidget(self.function_combo3)
+
+        function_layout.addStretch()
+        function_group.setLayout(function_layout)
+        layout.addWidget(function_group)
+
+        # 功能内容区域（使用堆叠窗口）
+        self.function_stack3 = QStackedWidget()
+
+        # 图片丢失检查功能
+        self.image_missing_check_widget = ImageMissingCheckWidget(self.db_manager)
+        self.function_stack3.addWidget(self.image_missing_check_widget)
+
+        # 占位页面（其他功能）
+        placeholder_widget3 = QWidget()
+        placeholder_layout3 = QVBoxLayout()
+        placeholder_label3 = QLabel("该功能正在开发中...")
+        placeholder_label3.setAlignment(Qt.AlignCenter)
+        placeholder_label3.setStyleSheet("font-size: 16px; color: gray;")
+        placeholder_layout3.addWidget(placeholder_label3)
+        placeholder_widget3.setLayout(placeholder_layout3)
+        self.function_stack3.addWidget(placeholder_widget3)
+
+        layout.addWidget(self.function_stack3)
+
+        widget.setLayout(layout)
+        return widget
+
+    def on_function_changed3(self, text):
+        """迁移任务3功能选择变化"""
+        if "图片丢失检查" in text:
+            self.function_stack3.setCurrentIndex(0)
+        else:
+            self.function_stack3.setCurrentIndex(1)
     
     def load_datasources(self):
         """加载数据源列表"""
