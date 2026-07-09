@@ -54,6 +54,7 @@ from .ptzcb_bank_export_widget import PtzcbBankExportWidget
 from .zhb_bank_register_fill_widget import ZhbBankRegisterFillWidget
 from .soft_delete_widget import SoftDeleteWidget
 from .image_missing_check_widget import ImageMissingCheckWidget
+from .image_missing_fill_widget import ImageMissingFillWidget
 
 
 class MainWindow(QMainWindow):
@@ -577,6 +578,7 @@ class MainWindow(QMainWindow):
 
         self.function_combo3 = QComboBox()
         self.function_combo3.addItem("图片丢失检查", "image_missing_check")
+        self.function_combo3.addItem("图片回填", "image_missing_fill")
         self.function_combo3.currentTextChanged.connect(self.on_function_changed3)
         function_layout.addWidget(self.function_combo3)
 
@@ -590,6 +592,10 @@ class MainWindow(QMainWindow):
         # 图片丢失检查功能
         self.image_missing_check_widget = ImageMissingCheckWidget(self.db_manager)
         self.function_stack3.addWidget(self.image_missing_check_widget)
+
+        # 图片回填功能
+        self.image_missing_fill_widget = ImageMissingFillWidget(self.db_manager)
+        self.function_stack3.addWidget(self.image_missing_fill_widget)
 
         # 占位页面（其他功能）
         placeholder_widget3 = QWidget()
@@ -610,8 +616,10 @@ class MainWindow(QMainWindow):
         """迁移任务3功能选择变化"""
         if "图片丢失检查" in text:
             self.function_stack3.setCurrentIndex(0)
-        else:
+        elif "图片回填" in text:
             self.function_stack3.setCurrentIndex(1)
+        else:
+            self.function_stack3.setCurrentIndex(2)
     
     def load_datasources(self):
         """加载数据源列表"""
