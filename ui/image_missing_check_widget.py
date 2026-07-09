@@ -17,7 +17,7 @@ from datetime import datetime
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
                              QPushButton, QLabel, QMessageBox, QComboBox,
                              QGroupBox, QProgressBar, QTextEdit, QFileDialog,
-                             QLineEdit, QListWidget, QListWidgetItem,
+                             QLineEdit, QListWidget, QListWidgetItem, QCheckBox,
                              QTableWidget, QTableWidgetItem, QHeaderView)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 import pandas as pd
@@ -39,7 +39,8 @@ class ImageMissingCheckWorker(QThread):
     error = pyqtSignal(str)
 
     def __init__(self, datasource, table_name, check_fields, legal_field,
-                 base_url, output_dir, id_field='id'):
+                 base_url, output_dir, id_field='id',
+                 dept_config=None, legal_link_config=None, concat_field=''):
         super().__init__()
         self.datasource = datasource
         self.table_name = table_name
@@ -49,6 +50,12 @@ class ImageMissingCheckWorker(QThread):
         self.base_url = base_url.rstrip('/')
         self.output_dir = output_dir
         self.id_field = id_field
+        # 部门分组: {'admin_field','admin_table','admin_pk','dept_field'}
+        self.dept_config = dept_config
+        # 法人名关联: {'link_field','link_table','link_pk','name_field'}
+        self.legal_link_config = legal_link_config
+        # 拼接本表字段（如 company_name）
+        self.concat_field = concat_field
         self.stop_requested = False
         self.url_cache = {}
         self.results = {
@@ -116,6 +123,17 @@ class ImageMissingCheckWorker(QThread):
                 entries.append(item)
         return entries, True
 
+    def dept_label(self, dept_value):
+        """部门目录名：4=日联一部, 5=日联二部, 其它值单独一份，查不到归为其他"""
+        if dept_value is None or str(dept_value).strip() == '':
+            return '其他'
+        dept_str = str(dept_value).strip()
+        if dept_str == '4':
+            return '日联一部'
+        if dept_str == '5':
+            return '日联二部'
+        return f'部门_{sanitize_name(dept_str)}'
+
     def run(self):
         try:
             connection = pymysql.connect(
@@ -134,9 +152,38 @@ class ImageMissingCheckWorker(QThread):
             select_fields = [self.id_field] + field_names
             if self.legal_field and self.legal_field not in select_fields:
                 select_fields.append(self.legal_field)
+            if self.concat_field and self.concat_field not in select_fields:
+                select_fields.append(self.concat_field)
+            if self.legal_link_config and self.legal_link_config['link_field'] not in select_fields:
+                select_fields.append(self.legal_link_config['link_field'])
+            if self.dept_config and self.dept_config['admin_field'] not in select_fields:
+                select_fields.append(self.dept_config['admin_field'])
             columns_sql = ', '.join([f'`{f}`' for f in select_fields])
             cursor.execute(f"SELECT {columns_sql} FROM `{self.table_name}`")
             rows = cursor.fetchall()
+
+            # 预加载管理员→部门映射
+            admin_dept_map = {}
+            if self.dept_config:
+                cfg = self.dept_config
+                cursor.execute(
+                    f"SELECT `{cfg['admin_pk']}`, `{cfg['dept_field']}` FROM `{cfg['admin_table']}`")
+                for r in cursor.fetchall():
+                    admin_dept_map[str(r[cfg['admin_pk']])] = r[cfg['dept_field']]
+                self.log_message.emit(
+                    f"已加载 {cfg['admin_table']} 部门映射 {len(admin_dept_map)} 条")
+
+            # 预加载关联表→法人名映射
+            legal_name_map = {}
+            if self.legal_link_config:
+                cfg = self.legal_link_config
+                cursor.execute(
+                    f"SELECT `{cfg['link_pk']}`, `{cfg['name_field']}` FROM `{cfg['link_table']}`")
+                for r in cursor.fetchall():
+                    legal_name_map[str(r[cfg['link_pk']])] = r[cfg['name_field']]
+                self.log_message.emit(
+                    f"已加载 {cfg['link_table']} 法人名映射 {len(legal_name_map)} 条")
+
             cursor.close()
             connection.close()
 
@@ -151,7 +198,27 @@ class ImageMissingCheckWorker(QThread):
                     break
 
                 row_id = row.get(self.id_field)
-                legal_name = sanitize_name(row.get(self.legal_field, '')) if self.legal_field else str(row_id)
+
+                # 法人名：本表字段或关联表字段，可拼接本表字段（如company_name）
+                if self.legal_link_config:
+                    link_value = row.get(self.legal_link_config['link_field'])
+                    base_name = legal_name_map.get(str(link_value), '') if link_value is not None else ''
+                    if not base_name:
+                        base_name = f"未关联_{link_value}" if link_value is not None else '未关联'
+                else:
+                    base_name = row.get(self.legal_field, '') if self.legal_field else str(row_id)
+                if self.concat_field:
+                    concat_value = row.get(self.concat_field) or ''
+                    if concat_value:
+                        base_name = f"{base_name}_{concat_value}" if base_name else str(concat_value)
+                legal_name = sanitize_name(base_name)
+
+                # 部门
+                dept_name = ''
+                if self.dept_config:
+                    admin_value = row.get(self.dept_config['admin_field'])
+                    dept_value = admin_dept_map.get(str(admin_value)) if admin_value is not None else None
+                    dept_name = self.dept_label(dept_value)
 
                 for field_name, field_comment in self.check_fields:
                     entries, is_valid = self.parse_file_entries(row.get(field_name))
@@ -169,6 +236,7 @@ class ImageMissingCheckWorker(QThread):
                             self.results['missing_files'] += 1
                             record = {
                                 'row_id': row_id,
+                                'dept': dept_name,
                                 'legal_name': legal_name,
                                 'field_name': field_name,
                                 'field_comment': field_comment or field_name,
@@ -207,7 +275,10 @@ class ImageMissingCheckWorker(QThread):
         os.makedirs(root_dir, exist_ok=True)
 
         for record in records:
-            legal_dir = os.path.join(root_dir, sanitize_name(record['legal_name']))
+            base_dir = root_dir
+            if record.get('dept'):
+                base_dir = os.path.join(root_dir, sanitize_name(record['dept']))
+            legal_dir = os.path.join(base_dir, sanitize_name(record['legal_name']))
             field_dir = os.path.join(legal_dir, sanitize_name(record['field_comment']))
             # 每个丢失文件对应一个固定位置的子文件夹，业务把补充的图片放进去即可，
             # 文件名可以不一样，回填时按文件夹对应的 行ID/字段/序号 精确回填
@@ -220,6 +291,8 @@ class ImageMissingCheckWorker(QThread):
             with open(readme_path, 'w', encoding='utf-8') as f:
                 f.write(f"表名: {self.table_name}\n")
                 f.write(f"行ID: {record['row_id']}\n")
+                if record.get('dept'):
+                    f.write(f"部门: {record['dept']}\n")
                 f.write(f"法人: {record['legal_name']}\n")
                 f.write(f"字段: {record['field_name']} ({record['field_comment']})\n")
                 f.write(f"数组位置: 第{record['index'] + 1}个\n")
@@ -246,6 +319,7 @@ class ImageMissingCheckWorker(QThread):
         df = pd.DataFrame(records)
         df = df.rename(columns={
             'row_id': '行ID',
+            'dept': '部门',
             'legal_name': '法人',
             'field_name': '字段名',
             'field_comment': '字段备注',
@@ -304,10 +378,54 @@ class ImageMissingCheckWidget(QWidget):
         form_layout.addRow("检查字段(勾选):", self.fields_list)
 
         self.legal_field_combo = QComboBox()
-        form_layout.addRow("法人名字段:", self.legal_field_combo)
+        form_layout.addRow("法人名字段(本表):", self.legal_field_combo)
 
         self.id_field_combo = QComboBox()
         form_layout.addRow("主键字段:", self.id_field_combo)
+
+        # 法人名关联配置（如 ba_rlb_legal_information 通过 legal_id 关联 ba_rlb_customer 取 legal_name）
+        self.legal_link_checkbox = QCheckBox(
+            "从关联表取法人名（如 legal_id → ba_rlb_customer.legal_name，勾选后忽略上面本表法人名字段）")
+        form_layout.addRow("", self.legal_link_checkbox)
+
+        legal_link_layout = QHBoxLayout()
+        legal_link_layout.addWidget(QLabel("本表关联字段:"))
+        self.link_field_edit = QLineEdit("legal_id")
+        legal_link_layout.addWidget(self.link_field_edit)
+        legal_link_layout.addWidget(QLabel("关联表:"))
+        self.link_table_edit = QLineEdit("ba_rlb_customer")
+        legal_link_layout.addWidget(self.link_table_edit)
+        legal_link_layout.addWidget(QLabel("关联表主键:"))
+        self.link_pk_edit = QLineEdit("id")
+        legal_link_layout.addWidget(self.link_pk_edit)
+        legal_link_layout.addWidget(QLabel("法人名字段:"))
+        self.link_name_edit = QLineEdit("legal_name")
+        legal_link_layout.addWidget(self.link_name_edit)
+        form_layout.addRow("", legal_link_layout)
+
+        self.concat_field_edit = QLineEdit()
+        self.concat_field_edit.setPlaceholderText("可选，如 company_name，目录名为 法人名_拼接字段值")
+        form_layout.addRow("目录名拼接本表字段:", self.concat_field_edit)
+
+        # 部门分组配置（admin_id → ba_admin.dept_id，4=日联一部 5=日联二部，其它单独一份）
+        self.dept_checkbox = QCheckBox(
+            "按部门分目录（admin_id → 管理员表查部门，4=日联一部 5=日联二部，其它部门单独一份，查不到归为其他）")
+        form_layout.addRow("", self.dept_checkbox)
+
+        dept_layout = QHBoxLayout()
+        dept_layout.addWidget(QLabel("本表管理员字段:"))
+        self.admin_field_edit = QLineEdit("admin_id")
+        dept_layout.addWidget(self.admin_field_edit)
+        dept_layout.addWidget(QLabel("管理员表:"))
+        self.admin_table_edit = QLineEdit("ba_admin")
+        dept_layout.addWidget(self.admin_table_edit)
+        dept_layout.addWidget(QLabel("管理员表主键:"))
+        self.admin_pk_edit = QLineEdit("id")
+        dept_layout.addWidget(self.admin_pk_edit)
+        dept_layout.addWidget(QLabel("部门字段:"))
+        self.dept_field_edit = QLineEdit("dept_id")
+        dept_layout.addWidget(self.dept_field_edit)
+        form_layout.addRow("", dept_layout)
 
         self.base_url_edit = QLineEdit()
         self.base_url_edit.setPlaceholderText(
@@ -348,9 +466,9 @@ class ImageMissingCheckWidget(QWidget):
         result_group = QGroupBox("缺失结果")
         result_layout = QVBoxLayout()
         self.result_table = QTableWidget()
-        self.result_table.setColumnCount(7)
+        self.result_table.setColumnCount(8)
         self.result_table.setHorizontalHeaderLabels([
-            "行ID", "法人", "字段名", "字段备注", "位置", "原文件名", "原URL"
+            "行ID", "部门", "法人", "字段名", "字段备注", "位置", "原文件名", "原URL"
         ])
         self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.result_table.horizontalHeader().setStretchLastSection(True)
@@ -468,9 +586,35 @@ class ImageMissingCheckWidget(QWidget):
         if not check_fields:
             QMessageBox.warning(self, "提示", "请勾选要检查的字段")
             return
-        if not legal_field:
-            QMessageBox.warning(self, "提示", "请选择法人名字段")
+
+        legal_link_config = None
+        if self.legal_link_checkbox.isChecked():
+            legal_link_config = {
+                'link_field': self.link_field_edit.text().strip(),
+                'link_table': self.link_table_edit.text().strip(),
+                'link_pk': self.link_pk_edit.text().strip(),
+                'name_field': self.link_name_edit.text().strip(),
+            }
+            if not all(legal_link_config.values()):
+                QMessageBox.warning(self, "提示", "请填写完整的法人名关联配置")
+                return
+        elif not legal_field:
+            QMessageBox.warning(self, "提示", "请选择法人名字段或启用关联表取法人名")
             return
+
+        dept_config = None
+        if self.dept_checkbox.isChecked():
+            dept_config = {
+                'admin_field': self.admin_field_edit.text().strip(),
+                'admin_table': self.admin_table_edit.text().strip(),
+                'admin_pk': self.admin_pk_edit.text().strip(),
+                'dept_field': self.dept_field_edit.text().strip(),
+            }
+            if not all(dept_config.values()):
+                QMessageBox.warning(self, "提示", "请填写完整的部门分组配置")
+                return
+
+        concat_field = self.concat_field_edit.text().strip()
         if not id_field:
             QMessageBox.warning(self, "提示", "请选择主键字段")
             return
@@ -489,7 +633,10 @@ class ImageMissingCheckWidget(QWidget):
 
         self.worker = ImageMissingCheckWorker(
             datasource, table_name, check_fields, legal_field,
-            base_url, output_dir, id_field)
+            base_url, output_dir, id_field,
+            dept_config=dept_config,
+            legal_link_config=legal_link_config,
+            concat_field=concat_field)
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log_message.connect(self.log)
         self.worker.finished.connect(self.on_finished)
@@ -512,12 +659,13 @@ class ImageMissingCheckWidget(QWidget):
             row = self.result_table.rowCount()
             self.result_table.insertRow(row)
             self.result_table.setItem(row, 0, QTableWidgetItem(str(record['row_id'])))
-            self.result_table.setItem(row, 1, QTableWidgetItem(str(record['legal_name'])))
-            self.result_table.setItem(row, 2, QTableWidgetItem(str(record['field_name'])))
-            self.result_table.setItem(row, 3, QTableWidgetItem(str(record['field_comment'])))
-            self.result_table.setItem(row, 4, QTableWidgetItem(str(record['index'] + 1)))
-            self.result_table.setItem(row, 5, QTableWidgetItem(str(record['file_name'])))
-            self.result_table.setItem(row, 6, QTableWidgetItem(str(record['url'])))
+            self.result_table.setItem(row, 1, QTableWidgetItem(str(record.get('dept', ''))))
+            self.result_table.setItem(row, 2, QTableWidgetItem(str(record['legal_name'])))
+            self.result_table.setItem(row, 3, QTableWidgetItem(str(record['field_name'])))
+            self.result_table.setItem(row, 4, QTableWidgetItem(str(record['field_comment'])))
+            self.result_table.setItem(row, 5, QTableWidgetItem(str(record['index'] + 1)))
+            self.result_table.setItem(row, 6, QTableWidgetItem(str(record['file_name'])))
+            self.result_table.setItem(row, 7, QTableWidgetItem(str(record['url'])))
 
         summary = (f"检查完成: 共 {results['total_rows']} 行, "
                    f"检查文件 {results['checked_files']} 个, "
