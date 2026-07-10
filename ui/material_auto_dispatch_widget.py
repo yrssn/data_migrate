@@ -113,8 +113,9 @@ class MaterialAutoDispatchWorker(QThread):
                     base = os.path.basename(folder)
                     score = max(self.similarity(part, base) for part in name_parts)
                     if score > best_score or (score == best_score and best is not None
-                                              and len(folder) > len(best)):
-                        # 同分时优先更深层（更具体）的文件夹
+                                              and len(folder) < len(best)):
+                        # 同分时优先更浅层的文件夹（文件收集是递归的，
+                        # 取浅层可把散落在外层和嵌套子文件夹里的文件都包含进来）
                         best, best_score = folder, score
                 if best is not None and best_score >= self.threshold:
                     folder_map[legal_name] = best
