@@ -17,7 +17,7 @@ from datetime import datetime
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
                              QPushButton, QLabel, QMessageBox,
                              QGroupBox, QProgressBar, QTextEdit, QFileDialog,
-                             QLineEdit, QCheckBox, QDoubleSpinBox,
+                             QLineEdit, QCheckBox, QDoubleSpinBox, QComboBox,
                              QTableWidget, QTableWidgetItem, QHeaderView)
 from PyQt5.QtCore import QThread, pyqtSignal
 import pandas as pd
@@ -39,12 +39,14 @@ class MaterialAutoDispatchWorker(QThread):
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
 
-    def __init__(self, manifest_path, material_dir, threshold, preview):
+    def __init__(self, manifest_path, material_dir, threshold, preview,
+                 dept_filter=''):
         super().__init__()
         self.manifest_path = manifest_path
         self.material_dir = material_dir
         self.threshold = threshold
         self.preview = preview
+        self.dept_filter = dept_filter
         self.results = {
             'total_missing': 0,
             'matched': 0,
@@ -88,6 +90,11 @@ class MaterialAutoDispatchWorker(QThread):
             root_dir = os.path.dirname(os.path.abspath(self.manifest_path))
             self.results['total_missing'] = len(missing)
             self.log_message.emit(f"清单加载成功，共 {len(missing)} 个缺失文件")
+            if self.dept_filter:
+                missing = [r for r in missing
+                           if str(r.get('dept', '')) == self.dept_filter]
+                self.log_message.emit(
+                    f"只处理部门「{self.dept_filter}」，共 {len(missing)} 个缺失文件")
             self.progress.emit(5)
 
             # 按 部门+法人 分组缺失记录（业务文件夹和法人是一对一的，
@@ -231,6 +238,13 @@ class MaterialAutoDispatchWorker(QThread):
                         else:
                             try:
                                 os.makedirs(dest_folder, exist_ok=True)
+                                # 一个说明.txt只对应一个文件：先删掉旧文件
+                                for old in os.listdir(dest_folder):
+                                    if old.lower() in IGNORED_FILES:
+                                        continue
+                                    old_path = os.path.join(dest_folder, old)
+                                    if os.path.isfile(old_path):
+                                        os.remove(old_path)
                                 shutil.copy2(src, os.path.join(
                                     dest_folder, os.path.basename(src)))
                                 self.results['copied'] += 1
@@ -318,6 +332,10 @@ class MaterialAutoDispatchWidget(QWidget):
         material_layout.addWidget(self.select_material_btn)
         form_layout.addRow("业务资料目录:", material_layout)
 
+        self.dept_combo = QComboBox()
+        self.dept_combo.addItem("全部部门")
+        form_layout.addRow("只处理部门:", self.dept_combo)
+
         self.threshold_spin = QDoubleSpinBox()
         self.threshold_spin.setRange(0.1, 1.0)
         self.threshold_spin.setSingleStep(0.05)
@@ -366,8 +384,20 @@ class MaterialAutoDispatchWidget(QWidget):
     def select_manifest(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self, "选择缺失清单.json", "", "JSON文件 (*.json)")
-        if file_path:
-            self.manifest_edit.setText(file_path)
+        if not file_path:
+            return
+        self.manifest_edit.setText(file_path)
+        self.dept_combo.clear()
+        self.dept_combo.addItem("全部部门")
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                manifest = json.load(f)
+            depts = sorted({str(r.get('dept', '')) for r in manifest.get('missing', [])
+                            if str(r.get('dept', '')).strip()})
+            for dept in depts:
+                self.dept_combo.addItem(dept)
+        except Exception as e:
+            QMessageBox.warning(self, "提示", f"读取清单失败: {str(e)}")
 
     def select_material_dir(self):
         dir_path = QFileDialog.getExistingDirectory(self, "选择业务资料根目录")
@@ -399,8 +429,13 @@ class MaterialAutoDispatchWidget(QWidget):
         self.progress_bar.setValue(0)
         self.start_btn.setEnabled(False)
 
+        dept_filter = ''
+        if self.dept_combo.currentIndex() > 0:
+            dept_filter = self.dept_combo.currentText()
+
         self.worker = MaterialAutoDispatchWorker(
-            manifest_path, material_dir, self.threshold_spin.value(), preview)
+            manifest_path, material_dir, self.threshold_spin.value(), preview,
+            dept_filter)
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log_message.connect(self.log)
         self.worker.finished.connect(self.on_finished)
