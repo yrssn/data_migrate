@@ -232,6 +232,11 @@ class MaterialAutoDispatchWorker(QThread):
                         result_row['匹配文件'] = os.path.relpath(src, self.material_dir)
                         result_row['相似度'] = f"{score:.2f}"
                         self.results['matched'] += 1
+                        if not record.get('folder'):
+                            result_row['结果'] = '清单中无对应文件夹（生成时建目录失败）'
+                            self.results['records'].append(result_row)
+                            self.progress.emit(5 + int(done / total * 90))
+                            continue
                         dest_folder = os.path.join(root_dir, record.get('folder', ''))
                         if self.preview:
                             result_row['结果'] = '预览: 待复制'

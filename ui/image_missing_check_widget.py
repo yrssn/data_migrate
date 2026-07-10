@@ -24,10 +24,15 @@ import pandas as pd
 import pymysql
 
 
-def sanitize_name(name: str) -> str:
-    """清理文件夹/文件名中的非法字符"""
+def sanitize_name(name: str, max_len: int = 60) -> str:
+    """清理文件夹/文件名中的非法字符，截断超长名字，
+    去掉Windows不允许的结尾点/空格"""
     name = str(name or '').strip()
     name = re.sub(r'[\\/:*?"<>|\r\n\t]', '_', name)
+    name = re.sub(r'&[a-zA-Z]+;|&#\d+;', '_', name)
+    if len(name) > max_len:
+        name = name[:max_len]
+    name = name.rstrip('. ')
     return name or '未命名'
 
 
@@ -274,33 +279,45 @@ class ImageMissingCheckWorker(QThread):
         root_dir = os.path.join(self.output_dir, f"缺失_{self.table_name}_{timestamp}")
         os.makedirs(root_dir, exist_ok=True)
 
+        failed_folders = 0
         for record in records:
-            base_dir = root_dir
-            if record.get('dept'):
-                base_dir = os.path.join(root_dir, sanitize_name(record['dept']))
-            legal_dir = os.path.join(base_dir, sanitize_name(record['legal_name']))
-            field_dir = os.path.join(legal_dir, sanitize_name(record['field_comment']))
-            # 每个丢失文件对应一个固定位置的子文件夹，业务把补充的图片放进去即可，
-            # 文件名可以不一样，回填时按文件夹对应的 行ID/字段/序号 精确回填
-            entry_dir = os.path.join(
-                field_dir,
-                f"{record['index'] + 1:02d}_{sanitize_name(record['file_name'])}")
-            os.makedirs(entry_dir, exist_ok=True)
-
-            readme_path = os.path.join(entry_dir, '说明.txt')
-            with open(readme_path, 'w', encoding='utf-8') as f:
-                f.write(f"表名: {self.table_name}\n")
-                f.write(f"行ID: {record['row_id']}\n")
+            try:
+                base_dir = root_dir
                 if record.get('dept'):
-                    f.write(f"部门: {record['dept']}\n")
-                f.write(f"法人: {record['legal_name']}\n")
-                f.write(f"字段: {record['field_name']} ({record['field_comment']})\n")
-                f.write(f"数组位置: 第{record['index'] + 1}个\n")
-                f.write(f"原文件名: {record['file_name']}\n")
-                f.write(f"原URL: {record['url']}\n")
-                f.write("请将补充的图片文件放到本文件夹中（文件名可以不一样，一个文件夹只放一个文件）\n")
+                    base_dir = os.path.join(root_dir, sanitize_name(record['dept']))
+                legal_dir = os.path.join(base_dir, sanitize_name(record['legal_name']))
+                field_dir = os.path.join(legal_dir, sanitize_name(record['field_comment']))
+                # 每个丢失文件对应一个固定位置的子文件夹，业务把补充的图片放进去即可，
+                # 文件名可以不一样，回填时按文件夹对应的 行ID/字段/序号 精确回填
+                entry_dir = os.path.join(
+                    field_dir,
+                    f"{record['index'] + 1:02d}_{sanitize_name(record['file_name'])}")
+                os.makedirs(entry_dir, exist_ok=True)
 
-            record['folder'] = os.path.relpath(entry_dir, root_dir)
+                readme_path = os.path.join(entry_dir, '说明.txt')
+                with open(readme_path, 'w', encoding='utf-8') as f:
+                    f.write(f"表名: {self.table_name}\n")
+                    f.write(f"行ID: {record['row_id']}\n")
+                    if record.get('dept'):
+                        f.write(f"部门: {record['dept']}\n")
+                    f.write(f"法人: {record['legal_name']}\n")
+                    f.write(f"字段: {record['field_name']} ({record['field_comment']})\n")
+                    f.write(f"数组位置: 第{record['index'] + 1}个\n")
+                    f.write(f"原文件名: {record['file_name']}\n")
+                    f.write(f"原URL: {record['url']}\n")
+                    f.write("请将补充的图片文件放到本文件夹中（文件名可以不一样，一个文件夹只放一个文件）\n")
+
+                record['folder'] = os.path.relpath(entry_dir, root_dir)
+            except Exception as e:
+                # 单条失败不影响其他记录
+                failed_folders += 1
+                record['folder'] = ''
+                self.log_message.emit(
+                    f"[建目录失败] id={record.get('row_id')} {record.get('legal_name')} "
+                    f"{record.get('field_comment')} 第{record.get('index', 0) + 1}个 "
+                    f"文件名: {record.get('file_name')} 原因: {str(e)}")
+        if failed_folders:
+            self.log_message.emit(f"共有 {failed_folders} 条记录建目录失败，请查看上方日志")
 
         # JSON清单，供后续回填脚本使用
         manifest = {

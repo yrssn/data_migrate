@@ -95,6 +95,12 @@ class ImageMissingFillWorker(QThread):
                         self.results['records'].append(result_row)
                         continue
 
+                    if not folder_rel:
+                        self.results['failed'] += 1
+                        result_row['处理结果'] = '清单中无对应文件夹（生成时建目录失败）'
+                        self.results['records'].append(result_row)
+                        continue
+
                     provided = self.find_provided_file(folder)
                     if not provided:
                         self.results['not_provided'] += 1
