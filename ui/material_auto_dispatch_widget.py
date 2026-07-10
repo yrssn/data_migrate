@@ -87,19 +87,26 @@ class MaterialAutoDispatchWorker(QThread):
             for record in missing:
                 legal_records.setdefault(str(record.get('legal_name', '')), []).append(record)
 
-            # 业务资料文件夹（每个法人一个文件夹）
-            material_folders = [
-                d for d in sorted(os.listdir(self.material_dir))
-                if os.path.isdir(os.path.join(self.material_dir, d))]
-            self.log_message.emit(f"业务资料目录下共 {len(material_folders)} 个文件夹")
+            # 业务资料文件夹（任意层级都参与法人匹配）
+            material_folders = []
+            for walk_root, walk_dirs, _ in os.walk(self.material_dir):
+                for d in sorted(walk_dirs):
+                    material_folders.append(os.path.relpath(
+                        os.path.join(walk_root, d), self.material_dir))
+            self.log_message.emit(f"业务资料目录下共 {len(material_folders)} 个文件夹（含子目录）")
 
-            # 法人 ↔ 业务文件夹匹配
+            # 法人 ↔ 业务文件夹匹配（按文件夹名，法人名整体和各段都参与）
             folder_map = {}
             for legal_name in legal_records:
+                name_parts = [legal_name] + [
+                    p for p in re.split(r'[_／/\\]+', legal_name) if p.strip()]
                 best, best_score = None, 0.0
                 for folder in material_folders:
-                    score = self.similarity(legal_name, folder)
-                    if score > best_score:
+                    base = os.path.basename(folder)
+                    score = max(self.similarity(part, base) for part in name_parts)
+                    if score > best_score or (score == best_score and best is not None
+                                              and len(folder) > len(best)):
+                        # 同分时优先更深层（更具体）的文件夹
                         best, best_score = folder, score
                 if best is not None and best_score >= self.threshold:
                     folder_map[legal_name] = best
