@@ -103,25 +103,46 @@ class MaterialAutoDispatchWorker(QThread):
                         os.path.join(walk_root, d), self.material_dir))
             self.log_message.emit(f"业务资料目录下共 {len(material_folders)} 个文件夹（含子目录）")
 
-            # 法人 ↔ 业务文件夹匹配（按文件夹名，法人名整体和各段都参与）
-            folder_map = {}
+            # 法人 ↔ 业务文件夹匹配：全局唯一分配（高分优先，一个文件夹树只归一个法人），
+            # 避免公司名里 TRADING 之类的通用词导致抢占别人的文件夹
+            candidates = []
             for legal_name in legal_records:
                 name_parts = [legal_name] + [
                     p for p in re.split(r'[_／/\\]+', legal_name) if p.strip()]
-                best, best_score = None, 0.0
                 for folder in material_folders:
                     base = os.path.basename(folder)
                     score = max(self.similarity(part, base) for part in name_parts)
-                    if score > best_score or (score == best_score and best is not None
-                                              and len(folder) < len(best)):
-                        # 同分时优先更浅层的文件夹（文件收集是递归的，
-                        # 取浅层可把散落在外层和嵌套子文件夹里的文件都包含进来）
-                        best, best_score = folder, score
-                if best is not None and best_score >= self.threshold:
-                    folder_map[legal_name] = best
-                    self.log_message.emit(
-                        f"[法人匹配] {legal_name} <-> {best} (相似度 {best_score:.2f})")
-                else:
+                    if score >= self.threshold:
+                        # 同分时浅层文件夹优先（文件收集是递归的，浅层能把嵌套的都包进来）
+                        candidates.append((-score, folder.count(os.sep), len(folder),
+                                           legal_name, folder))
+            candidates.sort()
+
+            folder_map = {}
+            taken_folders = []
+
+            def conflicts(folder, legal_name):
+                fn = folder + os.sep
+                for taken, owner in taken_folders:
+                    if owner == legal_name:
+                        continue
+                    tn = taken + os.sep
+                    if fn.startswith(tn) or tn.startswith(fn):
+                        return True
+                return False
+
+            for neg_score, _, _, legal_name, folder in candidates:
+                if legal_name in folder_map:
+                    continue
+                if conflicts(folder, legal_name):
+                    continue
+                folder_map[legal_name] = folder
+                taken_folders.append((folder, legal_name))
+                self.log_message.emit(
+                    f"[法人匹配] {legal_name} <-> {folder} (相似度 {-neg_score:.2f})")
+
+            for legal_name in legal_records:
+                if legal_name not in folder_map:
                     self.log_message.emit(f"[法人未匹配] {legal_name} 找不到对应业务文件夹")
 
             all_files = self.collect_files(self.material_dir)
@@ -137,10 +158,14 @@ class MaterialAutoDispatchWorker(QThread):
                 else:
                     # 回退：全目录中路径含法人名片段的文件
                     norm_parts = [normalize(p) for p in name_parts if normalize(p)]
+                    other_dirs = [
+                        os.path.join(self.material_dir, taken) + os.sep
+                        for taken, owner in taken_folders if owner != legal_name]
                     files = [
                         f for f in all_files
-                        if any(part in normalize(os.path.relpath(f, self.material_dir))
-                               for part in norm_parts)]
+                        if not any(f.startswith(d) for d in other_dirs)
+                        and any(part in normalize(os.path.relpath(f, self.material_dir))
+                                for part in norm_parts)]
                     if files:
                         self.log_message.emit(
                             f"[回退匹配] {legal_name} 未匹配到文件夹，"
