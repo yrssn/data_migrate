@@ -54,6 +54,14 @@ class MaterialAutoDispatchWorker(QThread):
             'records': []
         }
 
+    def strip_parts(self, text: str, parts) -> str:
+        """从文本中剥掉法人/公司名等片段，留下资料类型关键词"""
+        norm = normalize(text)
+        for part in sorted((normalize(p) for p in parts), key=len, reverse=True):
+            if part:
+                norm = norm.replace(part, '')
+        return norm
+
     def similarity(self, a: str, b: str) -> float:
         a, b = normalize(a), normalize(b)
         if not a or not b:
@@ -115,12 +123,27 @@ class MaterialAutoDispatchWorker(QThread):
                 else:
                     self.log_message.emit(f"[法人未匹配] {legal_name} 找不到对应业务文件夹")
 
+            all_files = self.collect_files(self.material_dir)
+
             total = len(missing) if missing else 1
             done = 0
             for legal_name, records in legal_records.items():
+                name_parts = [p for p in re.split(r'[_／/\\]+', legal_name) if p.strip()]
                 folder = folder_map.get(legal_name)
-                files = self.collect_files(
-                    os.path.join(self.material_dir, folder)) if folder else []
+                if folder:
+                    files = self.collect_files(
+                        os.path.join(self.material_dir, folder))
+                else:
+                    # 回退：全目录中路径含法人名片段的文件
+                    norm_parts = [normalize(p) for p in name_parts if normalize(p)]
+                    files = [
+                        f for f in all_files
+                        if any(part in normalize(os.path.relpath(f, self.material_dir))
+                               for part in norm_parts)]
+                    if files:
+                        self.log_message.emit(
+                            f"[回退匹配] {legal_name} 未匹配到文件夹，"
+                            f"按路径含法人名找到 {len(files)} 个候选文件")
                 used_files = set()
 
                 # 每条缺失记录找最相似文件（唯一分配，按最高分优先）
@@ -129,10 +152,15 @@ class MaterialAutoDispatchWorker(QThread):
                     target_text = f"{record.get('field_comment', '')} {record.get('file_name', '')}"
                     for f_idx, path in enumerate(files):
                         base = os.path.splitext(os.path.basename(path))[0]
+                        stripped = self.strip_parts(base, name_parts)
                         score = max(
                             self.similarity(base, record.get('file_name', '')),
                             self.similarity(base, record.get('field_comment', '')),
-                            self.similarity(base, target_text))
+                            self.similarity(base, target_text),
+                            self.similarity(stripped, record.get('field_comment', '')),
+                            self.similarity(
+                                stripped,
+                                self.strip_parts(record.get('file_name', ''), name_parts)))
                         pairs.append((score, r_idx, f_idx))
                 pairs.sort(reverse=True)
 
@@ -159,7 +187,7 @@ class MaterialAutoDispatchWorker(QThread):
                         '相似度': '',
                         '结果': '',
                     }
-                    if folder is None:
+                    if folder is None and not files:
                         result_row['结果'] = '法人未匹配到业务文件夹'
                         self.results['unmatched_records'] += 1
                     elif r_idx not in assigned:
