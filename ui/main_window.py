@@ -55,6 +55,7 @@ from .zhb_bank_register_fill_widget import ZhbBankRegisterFillWidget
 from .soft_delete_widget import SoftDeleteWidget
 from .image_missing_check_widget import ImageMissingCheckWidget
 from .image_missing_fill_widget import ImageMissingFillWidget
+from .excel_unique_count_widget import ExcelUniqueCountWidget
 
 
 class MainWindow(QMainWindow):
@@ -579,6 +580,7 @@ class MainWindow(QMainWindow):
         self.function_combo3 = QComboBox()
         self.function_combo3.addItem("图片丢失检查", "image_missing_check")
         self.function_combo3.addItem("图片回填", "image_missing_fill")
+        self.function_combo3.addItem("Excel唯一值统计", "excel_unique_count")
         self.function_combo3.currentTextChanged.connect(self.on_function_changed3)
         function_layout.addWidget(self.function_combo3)
 
@@ -596,6 +598,10 @@ class MainWindow(QMainWindow):
         # 图片回填功能
         self.image_missing_fill_widget = ImageMissingFillWidget(self.db_manager)
         self.function_stack3.addWidget(self.image_missing_fill_widget)
+
+        # Excel唯一值统计功能
+        self.excel_unique_count_widget = ExcelUniqueCountWidget()
+        self.function_stack3.addWidget(self.excel_unique_count_widget)
 
         # 占位页面（其他功能）
         placeholder_widget3 = QWidget()
@@ -618,8 +624,10 @@ class MainWindow(QMainWindow):
             self.function_stack3.setCurrentIndex(0)
         elif "图片回填" in text:
             self.function_stack3.setCurrentIndex(1)
-        else:
+        elif "Excel唯一值统计" in text:
             self.function_stack3.setCurrentIndex(2)
+        else:
+            self.function_stack3.setCurrentIndex(3)
     
     def load_datasources(self):
         """加载数据源列表"""
