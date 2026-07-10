@@ -152,31 +152,14 @@ class MaterialAutoDispatchWorker(QThread):
                 if legal_name not in folder_map:
                     self.log_message.emit(f"[法人未匹配] {legal_name} 找不到对应业务文件夹")
 
-            all_files = self.collect_files(self.material_dir)
-
             total = len(missing) if missing else 1
             done = 0
             for legal_name, records in legal_records.items():
                 name_parts = [p for p in re.split(r'[_／/\\]+', legal_name) if p.strip()]
                 folder = folder_map.get(legal_name)
-                if folder:
-                    files = self.collect_files(
-                        os.path.join(self.material_dir, folder))
-                else:
-                    # 回退：全目录中路径含法人名片段的文件
-                    norm_parts = [normalize(p) for p in name_parts if normalize(p)]
-                    other_dirs = [
-                        os.path.join(self.material_dir, taken) + os.sep
-                        for taken, owner in taken_folders if owner != legal_name]
-                    files = [
-                        f for f in all_files
-                        if not any(f.startswith(d) for d in other_dirs)
-                        and any(part in normalize(os.path.relpath(f, self.material_dir))
-                                for part in norm_parts)]
-                    if files:
-                        self.log_message.emit(
-                            f"[回退匹配] {legal_name} 未匹配到文件夹，"
-                            f"按路径含法人名找到 {len(files)} 个候选文件")
+                # 只有法人文件夹确定匹配上才分发，否则一律不动
+                files = self.collect_files(
+                    os.path.join(self.material_dir, folder)) if folder else []
                 used_files = set()
 
                 # 每条缺失记录找最相似文件（唯一分配，按最高分优先）
@@ -220,7 +203,7 @@ class MaterialAutoDispatchWorker(QThread):
                         '相似度': '',
                         '结果': '',
                     }
-                    if folder is None and not files:
+                    if folder is None:
                         result_row['结果'] = '法人未匹配到业务文件夹'
                         self.results['unmatched_records'] += 1
                     elif r_idx not in assigned:
