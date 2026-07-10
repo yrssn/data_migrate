@@ -90,10 +90,12 @@ class MaterialAutoDispatchWorker(QThread):
             self.log_message.emit(f"清单加载成功，共 {len(missing)} 个缺失文件")
             self.progress.emit(5)
 
-            # 按法人分组缺失记录
+            # 按 部门+法人 分组缺失记录（业务文件夹和法人是一对一的，
+            # 不能跨部门复用）
             legal_records = {}
             for record in missing:
-                legal_records.setdefault(str(record.get('legal_name', '')), []).append(record)
+                key = (str(record.get('dept', '')), str(record.get('legal_name', '')))
+                legal_records.setdefault(key, []).append(record)
 
             # 业务资料文件夹（任意层级都参与法人匹配）
             material_folders = []
@@ -108,7 +110,8 @@ class MaterialAutoDispatchWorker(QThread):
             # 避免公司名里 TRADING 之类的通用词导致乱匹配；并全局唯一分配，
             # 一个文件夹树只归一个法人
             candidates = []
-            for legal_name in legal_records:
+            for group_key in legal_records:
+                legal_name = group_key[1]
                 name_parts = [legal_name] + [
                     p for p in re.split(r'[_／/\\]+', legal_name) if p.strip()]
                 for folder in material_folders:
@@ -122,41 +125,48 @@ class MaterialAutoDispatchWorker(QThread):
                     if score > 0:
                         # 同分时浅层文件夹优先（文件收集是递归的，浅层能把嵌套的都包进来）
                         candidates.append((-score, folder.count(os.sep), len(folder),
-                                           legal_name, folder))
-            candidates.sort()
+                                           group_key, folder))
+            candidates.sort(key=lambda c: (c[0], c[1], c[2]))
 
             folder_map = {}
             taken_folders = []
 
-            def conflicts(folder, legal_name):
+            def conflict_owner(folder, group_key):
                 fn = folder + os.sep
                 for taken, owner in taken_folders:
-                    if owner == legal_name:
+                    if owner == group_key:
                         continue
                     tn = taken + os.sep
                     if fn.startswith(tn) or tn.startswith(fn):
-                        return True
-                return False
+                        return owner
+                return None
 
-            for neg_score, _, _, legal_name, folder in candidates:
-                if legal_name in folder_map:
+            for neg_score, _, _, group_key, folder in candidates:
+                if group_key in folder_map:
                     continue
-                if conflicts(folder, legal_name):
+                owner = conflict_owner(folder, group_key)
+                if owner is not None:
+                    self.log_message.emit(
+                        f"[跳过] {group_key[0]}/{group_key[1]} 候选文件夹 {folder} "
+                        f"已被 {owner[0]}/{owner[1]} 占用")
                     continue
-                folder_map[legal_name] = folder
-                taken_folders.append((folder, legal_name))
+                folder_map[group_key] = folder
+                taken_folders.append((folder, group_key))
                 self.log_message.emit(
-                    f"[法人匹配] {legal_name} <-> {folder} (名称重合长度 {int(-neg_score)})")
+                    f"[法人匹配] {group_key[0]}/{group_key[1]} <-> {folder} "
+                    f"(名称重合长度 {int(-neg_score)})")
 
-            for legal_name in legal_records:
-                if legal_name not in folder_map:
-                    self.log_message.emit(f"[法人未匹配] {legal_name} 找不到对应业务文件夹")
+            for group_key in legal_records:
+                if group_key not in folder_map:
+                    self.log_message.emit(
+                        f"[法人未匹配] {group_key[0]}/{group_key[1]} 找不到对应业务文件夹")
 
             total = len(missing) if missing else 1
             done = 0
-            for legal_name, records in legal_records.items():
+            for group_key, records in legal_records.items():
+                legal_name = group_key[1]
                 name_parts = [p for p in re.split(r'[_／/\\]+', legal_name) if p.strip()]
-                folder = folder_map.get(legal_name)
+                folder = folder_map.get(group_key)
                 # 只有法人文件夹确定匹配上才分发，否则一律不动
                 files = self.collect_files(
                     os.path.join(self.material_dir, folder)) if folder else []
