@@ -103,16 +103,23 @@ class MaterialAutoDispatchWorker(QThread):
                         os.path.join(walk_root, d), self.material_dir))
             self.log_message.emit(f"业务资料目录下共 {len(material_folders)} 个文件夹（含子目录）")
 
-            # 法人 ↔ 业务文件夹匹配：全局唯一分配（高分优先，一个文件夹树只归一个法人），
-            # 避免公司名里 TRADING 之类的通用词导致抢占别人的文件夹
+            # 法人 ↔ 业务文件夹匹配：只认包含关系（法人名或公司名整段出现在
+            # 文件夹名里，或文件夹名整段出现在法人名里），不做模糊比对，
+            # 避免公司名里 TRADING 之类的通用词导致乱匹配；并全局唯一分配，
+            # 一个文件夹树只归一个法人
             candidates = []
             for legal_name in legal_records:
                 name_parts = [legal_name] + [
                     p for p in re.split(r'[_／/\\]+', legal_name) if p.strip()]
                 for folder in material_folders:
-                    base = os.path.basename(folder)
-                    score = max(self.similarity(part, base) for part in name_parts)
-                    if score >= self.threshold:
+                    base = normalize(os.path.basename(folder))
+                    score = 0.0
+                    for part in name_parts:
+                        p = normalize(part)
+                        if len(p) >= 2 and len(base) >= 2 and (p in base or base in p):
+                            # 重合的部分越长越优先
+                            score = max(score, min(len(p), len(base)))
+                    if score > 0:
                         # 同分时浅层文件夹优先（文件收集是递归的，浅层能把嵌套的都包进来）
                         candidates.append((-score, folder.count(os.sep), len(folder),
                                            legal_name, folder))
@@ -139,7 +146,7 @@ class MaterialAutoDispatchWorker(QThread):
                 folder_map[legal_name] = folder
                 taken_folders.append((folder, legal_name))
                 self.log_message.emit(
-                    f"[法人匹配] {legal_name} <-> {folder} (相似度 {-neg_score:.2f})")
+                    f"[法人匹配] {legal_name} <-> {folder} (名称重合长度 {int(-neg_score)})")
 
             for legal_name in legal_records:
                 if legal_name not in folder_map:
