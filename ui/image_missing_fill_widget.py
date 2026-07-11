@@ -67,6 +67,9 @@ class ImageMissingFillWorker(QThread):
             self.log_message.emit(f"清单加载成功: 表 {table}, 共 {len(missing)} 个缺失文件")
             self.progress.emit(5)
 
+            filled_records = []
+            remaining_records = []
+
             total = len(missing) if missing else 1
             for i, record in enumerate(missing):
                 row_id = record.get('row_id')
@@ -93,12 +96,14 @@ class ImageMissingFillWorker(QThread):
                         self.results['failed'] += 1
                         result_row['处理结果'] = '清单中缺少url，无法生成'
                         self.results['records'].append(result_row)
+                        remaining_records.append(record)
                         continue
 
                     if not folder_rel:
                         self.results['failed'] += 1
                         result_row['处理结果'] = '清单中无对应文件夹（生成时建目录失败）'
                         self.results['records'].append(result_row)
+                        remaining_records.append(record)
                         continue
 
                     provided = self.find_provided_file(folder)
@@ -106,6 +111,7 @@ class ImageMissingFillWorker(QThread):
                         self.results['not_provided'] += 1
                         result_row['处理结果'] = '未提供图片'
                         self.results['records'].append(result_row)
+                        remaining_records.append(record)
                         continue
 
                     self.results['found_files'] += 1
@@ -130,6 +136,8 @@ class ImageMissingFillWorker(QThread):
                     else:
                         result_row['处理结果'] = '已生成'
 
+                    filled_records.append(record)
+
                     self.log_message.emit(
                         f"[回填] id={row_id} {field_comment} 第{index + 1}个: "
                         f"{os.path.basename(provided)} -> {url}")
@@ -137,6 +145,7 @@ class ImageMissingFillWorker(QThread):
                     self.results['failed'] += 1
                     result_row['处理结果'] = f'失败: {str(e)}'
                     self.log_message.emit(f"[失败] id={row_id} {field_comment}: {str(e)}")
+                    remaining_records.append(record)
 
                 self.results['records'].append(result_row)
                 self.progress.emit(5 + int((i + 1) / total * 90))
@@ -149,6 +158,30 @@ class ImageMissingFillWorker(QThread):
                     excel_path, index=False, engine='openpyxl')
                 self.results['report_path'] = excel_path
                 self.log_message.emit(f"回填结果已导出: {excel_path}")
+
+                # 归档：已回填清单 + 剩余缺失清单（下次直接选剩余清单继续跑）
+                if filled_records:
+                    filled_manifest = dict(manifest)
+                    filled_manifest['missing'] = filled_records
+                    filled_json = os.path.join(root_dir, f'已回填清单_{timestamp}.json')
+                    with open(filled_json, 'w', encoding='utf-8') as f:
+                        json.dump(filled_manifest, f, ensure_ascii=False, indent=2)
+                    filled_xlsx = os.path.join(root_dir, f'已回填清单_{timestamp}.xlsx')
+                    pd.DataFrame(filled_records).to_excel(
+                        filled_xlsx, index=False, engine='openpyxl')
+                    self.log_message.emit(
+                        f"本次已回填 {len(filled_records)} 条，已导出: {filled_json} / {filled_xlsx}")
+
+                remaining_manifest = dict(manifest)
+                remaining_manifest['missing'] = remaining_records
+                remaining_json = os.path.join(root_dir, f'剩余缺失清单_{timestamp}.json')
+                with open(remaining_json, 'w', encoding='utf-8') as f:
+                    json.dump(remaining_manifest, f, ensure_ascii=False, indent=2)
+                remaining_xlsx = os.path.join(root_dir, f'剩余缺失清单_{timestamp}.xlsx')
+                pd.DataFrame(remaining_records).to_excel(
+                    remaining_xlsx, index=False, engine='openpyxl')
+                self.log_message.emit(
+                    f"剩余未回填 {len(remaining_records)} 条，下次回填直接选: {remaining_json}")
 
             self.progress.emit(100)
             self.finished.emit(self.results)
