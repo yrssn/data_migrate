@@ -148,8 +148,16 @@ class MaterialAutoDispatchWorker(QThread):
                         return owner
                 return None
 
+            def already_owned(folder, group_key):
+                fn = folder + os.sep
+                for taken in folder_map.get(group_key, []):
+                    tn = taken + os.sep
+                    if fn.startswith(tn) or tn.startswith(fn):
+                        return True
+                return False
+
             for neg_score, _, _, group_key, folder in candidates:
-                if group_key in folder_map:
+                if already_owned(folder, group_key):
                     continue
                 owner = conflict_owner(folder, group_key)
                 if owner is not None:
@@ -157,7 +165,9 @@ class MaterialAutoDispatchWorker(QThread):
                         f"[跳过] {group_key[0]}/{group_key[1]} 候选文件夹 {folder} "
                         f"已被 {owner[0]}/{owner[1]} 占用")
                     continue
-                folder_map[group_key] = folder
+                # 同一法人可以占多个同名/副本文件夹（如 xxx 和 xxx(1)），
+                # 但一个文件夹仍只归一个法人
+                folder_map.setdefault(group_key, []).append(folder)
                 taken_folders.append((folder, group_key))
                 self.log_message.emit(
                     f"[法人匹配] {group_key[0]}/{group_key[1]} <-> {folder} "
@@ -173,10 +183,13 @@ class MaterialAutoDispatchWorker(QThread):
             for group_key, records in legal_records.items():
                 legal_name = group_key[1]
                 name_parts = [p for p in re.split(r'[_／/\\]+', legal_name) if p.strip()]
-                folder = folder_map.get(group_key)
+                folders = folder_map.get(group_key, [])
+                folder = '; '.join(folders) if folders else None
                 # 只有法人文件夹确定匹配上才分发，否则一律不动
-                files = self.collect_files(
-                    os.path.join(self.material_dir, folder)) if folder else []
+                files = []
+                for fd in folders:
+                    files.extend(self.collect_files(
+                        os.path.join(self.material_dir, fd)))
                 used_files = set()
 
                 # 每条缺失记录找最相似文件（唯一分配，按最高分优先）
