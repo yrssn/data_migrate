@@ -516,9 +516,31 @@ class MaterialAutoDispatchWidget(QWidget):
                     seen.add(c[4])
                     combo.addItem(f"{c[4]} (重合{int(-c[0])})", c[4])
             combo.addItem("不分发", '')
+            combo.addItem("手动浏览选择...", '__browse__')
+            combo.activated.connect(
+                lambda _idx, c=combo: self.on_match_combo_activated(c))
             self.match_table.setCellWidget(row, 2, combo)
         self.log(f"扫描完成: 共 {len(group_keys)} 个法人，"
                  f"自动匹配到文件夹的 {len(auto_map)} 个，可在表里改选后再开始分发")
+
+    def on_match_combo_activated(self, combo):
+        """选了“手动浏览选择”时弹目录选择框，选业务资料目录下的任意文件夹"""
+        if combo.currentData() != '__browse__':
+            return
+        material_dir = self.material_edit.text().strip()
+        dir_path = QFileDialog.getExistingDirectory(
+            self, "选择该法人的业务文件夹", material_dir)
+        if not dir_path:
+            combo.setCurrentIndex(0)
+            return
+        rel = os.path.relpath(dir_path, material_dir)
+        if rel.startswith('..'):
+            QMessageBox.warning(self, "提示", "只能选业务资料目录下的文件夹")
+            combo.setCurrentIndex(0)
+            return
+        idx = combo.count() - 1
+        combo.insertItem(idx, f"手选: {rel}", rel)
+        combo.setCurrentIndex(idx)
 
     def get_folder_override(self):
         """收集表里手动改选的法人↔文件夹（选“自动”的不返回）"""
@@ -528,7 +550,7 @@ class MaterialAutoDispatchWidget(QWidget):
             if combo is None:
                 continue
             data = combo.currentData()
-            if data is None:
+            if data is None or data == '__browse__':
                 continue
             override[key] = [data] if data else []
         return override
