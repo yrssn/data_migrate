@@ -34,6 +34,79 @@ def normalize(text: str) -> str:
     return re.sub(r'[\s\-_—·．.,，、()（）\[\]【】]+', '', text)
 
 
+def list_material_folders(material_dir):
+    """递归列出业务资料目录下所有文件夹（相对路径）"""
+    folders = []
+    for walk_root, walk_dirs, _ in os.walk(material_dir):
+        for d in sorted(walk_dirs):
+            folders.append(os.path.relpath(
+                os.path.join(walk_root, d), material_dir))
+    return folders
+
+
+def build_folder_candidates(group_keys, material_folders):
+    """法人 ↔ 文件夹候选：只认包含关系，重合越长越优先，
+    返回排好序的 [(负分, 层级, 长度, group_key, folder)]"""
+    candidates = []
+    for group_key in group_keys:
+        legal_name = group_key[1]
+        name_parts = [legal_name] + [
+            p for p in re.split(r'[_／/\\]+', legal_name) if p.strip()]
+        for folder in material_folders:
+            base = normalize(os.path.basename(folder))
+            score = 0.0
+            for part in name_parts:
+                p = normalize(part)
+                if len(p) >= 2 and len(base) >= 2 and (p in base or base in p):
+                    score = max(score, min(len(p), len(base)))
+            if score > 0:
+                candidates.append((-score, folder.count(os.sep), len(folder),
+                                   group_key, folder))
+    candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+    return candidates
+
+
+def assign_folders(candidates, log=None):
+    """全局唯一分配：一个文件夹树只归一个法人，同一法人可占多个
+    同名/副本文件夹，返回 group_key -> [folders]"""
+    folder_map = {}
+    taken_folders = []
+
+    def conflict_owner(folder, group_key):
+        fn = folder + os.sep
+        for taken, owner in taken_folders:
+            if owner == group_key:
+                continue
+            tn = taken + os.sep
+            if fn.startswith(tn) or tn.startswith(fn):
+                return owner
+        return None
+
+    def already_owned(folder, group_key):
+        fn = folder + os.sep
+        for taken in folder_map.get(group_key, []):
+            tn = taken + os.sep
+            if fn.startswith(tn) or tn.startswith(fn):
+                return True
+        return False
+
+    for neg_score, _, _, group_key, folder in candidates:
+        if already_owned(folder, group_key):
+            continue
+        owner = conflict_owner(folder, group_key)
+        if owner is not None:
+            if log:
+                log(f"[跳过] {group_key[0]}/{group_key[1]} 候选文件夹 {folder} "
+                    f"已被 {owner[0]}/{owner[1]} 占用")
+            continue
+        folder_map.setdefault(group_key, []).append(folder)
+        taken_folders.append((folder, group_key))
+        if log:
+            log(f"[法人匹配] {group_key[0]}/{group_key[1]} <-> {folder} "
+                f"(名称重合长度 {int(-neg_score)})")
+    return folder_map
+
+
 class MaterialAutoDispatchWorker(QThread):
     """资料自动分发工作线程"""
     progress = pyqtSignal(int)
@@ -42,13 +115,14 @@ class MaterialAutoDispatchWorker(QThread):
     error = pyqtSignal(str)
 
     def __init__(self, manifest_path, material_dir, threshold, preview,
-                 dept_filter=''):
+                 dept_filter='', folder_override=None):
         super().__init__()
         self.manifest_path = manifest_path
         self.material_dir = material_dir
         self.threshold = threshold
         self.preview = preview
         self.dept_filter = dept_filter
+        self.folder_override = folder_override or {}
         self.results = {
             'total_missing': 0,
             'matched': 0,
@@ -107,73 +181,35 @@ class MaterialAutoDispatchWorker(QThread):
                 legal_records.setdefault(key, []).append(record)
 
             # 业务资料文件夹（任意层级都参与法人匹配）
-            material_folders = []
-            for walk_root, walk_dirs, _ in os.walk(self.material_dir):
-                for d in sorted(walk_dirs):
-                    material_folders.append(os.path.relpath(
-                        os.path.join(walk_root, d), self.material_dir))
+            material_folders = list_material_folders(self.material_dir)
             self.log_message.emit(f"业务资料目录下共 {len(material_folders)} 个文件夹（含子目录）")
 
-            # 法人 ↔ 业务文件夹匹配：只认包含关系（法人名或公司名整段出现在
-            # 文件夹名里，或文件夹名整段出现在法人名里），不做模糊比对，
-            # 避免公司名里 TRADING 之类的通用词导致乱匹配；并全局唯一分配，
-            # 一个文件夹树只归一个法人
-            candidates = []
-            for group_key in legal_records:
-                legal_name = group_key[1]
-                name_parts = [legal_name] + [
-                    p for p in re.split(r'[_／/\\]+', legal_name) if p.strip()]
-                for folder in material_folders:
-                    base = normalize(os.path.basename(folder))
-                    score = 0.0
-                    for part in name_parts:
-                        p = normalize(part)
-                        if len(p) >= 2 and len(base) >= 2 and (p in base or base in p):
-                            # 重合的部分越长越优先
-                            score = max(score, min(len(p), len(base)))
-                    if score > 0:
-                        # 同分时浅层文件夹优先（文件收集是递归的，浅层能把嵌套的都包进来）
-                        candidates.append((-score, folder.count(os.sep), len(folder),
-                                           group_key, folder))
-            candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+            candidates = build_folder_candidates(legal_records, material_folders)
+            folder_map = assign_folders(candidates, log=self.log_message.emit)
 
-            folder_map = {}
-            taken_folders = []
-
-            def conflict_owner(folder, group_key):
-                fn = folder + os.sep
-                for taken, owner in taken_folders:
-                    if owner == group_key:
-                        continue
-                    tn = taken + os.sep
-                    if fn.startswith(tn) or tn.startswith(fn):
-                        return owner
-                return None
-
-            def already_owned(folder, group_key):
-                fn = folder + os.sep
-                for taken in folder_map.get(group_key, []):
-                    tn = taken + os.sep
-                    if fn.startswith(tn) or tn.startswith(fn):
-                        return True
-                return False
-
-            for neg_score, _, _, group_key, folder in candidates:
-                if already_owned(folder, group_key):
-                    continue
-                owner = conflict_owner(folder, group_key)
-                if owner is not None:
+            # 应用手动确认的法人↔文件夹选择（优先于自动匹配）
+            if self.folder_override:
+                overridden_folders = []
+                for key, folders in self.folder_override.items():
+                    folder_map[key] = list(folders)
+                    overridden_folders.extend(folders)
                     self.log_message.emit(
-                        f"[跳过] {group_key[0]}/{group_key[1]} 候选文件夹 {folder} "
-                        f"已被 {owner[0]}/{owner[1]} 占用")
-                    continue
-                # 同一法人可以占多个同名/副本文件夹（如 xxx 和 xxx(1)），
-                # 但一个文件夹仍只归一个法人
-                folder_map.setdefault(group_key, []).append(folder)
-                taken_folders.append((folder, group_key))
-                self.log_message.emit(
-                    f"[法人匹配] {group_key[0]}/{group_key[1]} <-> {folder} "
-                    f"(名称重合长度 {int(-neg_score)})")
+                        f"[手动选择] {key[0]}/{key[1]} -> "
+                        f"{'; '.join(folders) if folders else '不分发'}")
+                # 手动选了的文件夹从其他法人的自动匹配里移除，保持一对一
+                for key in list(folder_map):
+                    if key in self.folder_override:
+                        continue
+                    kept = []
+                    for fd in folder_map[key]:
+                        fn = fd + os.sep
+                        if any(fn.startswith(o + os.sep) or (o + os.sep).startswith(fn)
+                               for o in overridden_folders):
+                            self.log_message.emit(
+                                f"[跳过] {key[0]}/{key[1]} 自动匹配的 {fd} 已被手动选择占用")
+                        else:
+                            kept.append(fd)
+                    folder_map[key] = kept
 
             for group_key in legal_records:
                 if group_key not in folder_map:
@@ -369,6 +405,24 @@ class MaterialAutoDispatchWidget(QWidget):
         config_group.setLayout(form_layout)
         layout.addWidget(config_group)
 
+        # 法人↔文件夹匹配确认：先扫描出所有疑似文件夹，人工确认/改选后再分发
+        match_group = QGroupBox("法人文件夹匹配确认（可选：先扫描，在下拉里改选后再开始分发）")
+        match_layout = QVBoxLayout()
+        self.scan_btn = QPushButton("扫描法人文件夹")
+        self.scan_btn.clicked.connect(self.scan_match)
+        match_layout.addWidget(self.scan_btn)
+        self.match_table = QTableWidget()
+        self.match_table.setColumnCount(3)
+        self.match_table.setHorizontalHeaderLabels(["部门", "法人", "业务文件夹（可改选）"])
+        self.match_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.match_table.horizontalHeader().setStretchLastSection(True)
+        self.match_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.match_table.setMinimumHeight(150)
+        match_layout.addWidget(self.match_table)
+        match_group.setLayout(match_layout)
+        layout.addWidget(match_group)
+        self.match_groups = []
+
         btn_layout = QHBoxLayout()
         self.start_btn = QPushButton("开始分发")
         self.start_btn.clicked.connect(self.start_dispatch)
@@ -419,6 +473,66 @@ class MaterialAutoDispatchWidget(QWidget):
         except Exception as e:
             QMessageBox.warning(self, "提示", f"读取清单失败: {str(e)}")
 
+    def scan_match(self):
+        """扫描每个法人的疑似业务文件夹，人工确认/改选"""
+        manifest_path = self.manifest_edit.text().strip()
+        material_dir = self.material_edit.text().strip()
+        if not manifest_path or not material_dir:
+            QMessageBox.warning(self, "提示", "请先选择缺失清单和业务资料目录")
+            return
+        try:
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                manifest = json.load(f)
+            missing = manifest.get('missing', [])
+            if self.dept_combo.currentIndex() > 0:
+                dept = self.dept_combo.currentText()
+                missing = [r for r in missing if str(r.get('dept', '')) == dept]
+            group_keys = []
+            for r in missing:
+                key = (str(r.get('dept', '')), str(r.get('legal_name', '')))
+                if key not in group_keys:
+                    group_keys.append(key)
+            material_folders = list_material_folders(material_dir)
+            candidates = build_folder_candidates(group_keys, material_folders)
+            auto_map = assign_folders(candidates)
+        except Exception as e:
+            QMessageBox.warning(self, "提示", f"扫描失败: {str(e)}")
+            return
+
+        self.match_groups = group_keys
+        self.match_table.setRowCount(0)
+        for key in group_keys:
+            row = self.match_table.rowCount()
+            self.match_table.insertRow(row)
+            self.match_table.setItem(row, 0, QTableWidgetItem(key[0]))
+            self.match_table.setItem(row, 1, QTableWidgetItem(key[1]))
+            combo = QComboBox()
+            auto_folders = auto_map.get(key, [])
+            combo.addItem(
+                f"自动: {'; '.join(auto_folders) if auto_folders else '未匹配'}", None)
+            seen = set()
+            for c in candidates:
+                if c[3] == key and c[4] not in seen:
+                    seen.add(c[4])
+                    combo.addItem(f"{c[4]} (重合{int(-c[0])})", c[4])
+            combo.addItem("不分发", '')
+            self.match_table.setCellWidget(row, 2, combo)
+        self.log(f"扫描完成: 共 {len(group_keys)} 个法人，"
+                 f"自动匹配到文件夹的 {len(auto_map)} 个，可在表里改选后再开始分发")
+
+    def get_folder_override(self):
+        """收集表里手动改选的法人↔文件夹（选“自动”的不返回）"""
+        override = {}
+        for row, key in enumerate(self.match_groups):
+            combo = self.match_table.cellWidget(row, 2)
+            if combo is None:
+                continue
+            data = combo.currentData()
+            if data is None:
+                continue
+            override[key] = [data] if data else []
+        return override
+
     def select_material_dir(self):
         dir_path = QFileDialog.getExistingDirectory(self, "选择业务资料根目录")
         if dir_path:
@@ -455,7 +569,7 @@ class MaterialAutoDispatchWidget(QWidget):
 
         self.worker = MaterialAutoDispatchWorker(
             manifest_path, material_dir, self.threshold_spin.value(), preview,
-            dept_filter)
+            dept_filter, self.get_folder_override())
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log_message.connect(self.log)
         self.worker.finished.connect(self.on_finished)
