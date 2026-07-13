@@ -13,6 +13,7 @@ import json
 import re
 import shutil
 import difflib
+import unicodedata
 from datetime import datetime
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
                              QPushButton, QLabel, QMessageBox,
@@ -27,8 +28,9 @@ IGNORED_FILES = {'说明.txt', 'thumbs.db', 'desktop.ini', '.ds_store'}
 
 
 def normalize(text: str) -> str:
-    """归一化用于匹配的文本：去空格、标点、大小写"""
-    text = str(text or '').lower()
+    """归一化用于匹配的文本：全角转半角、去空格、标点、大小写"""
+    # NFKC把全角字母/数字/空格转成半角（如 ＫＯＵＴＡ -> KOUTA）
+    text = unicodedata.normalize('NFKC', str(text or '')).lower()
     return re.sub(r'[\s\-_—·．.,，、()（）\[\]【】]+', '', text)
 
 
