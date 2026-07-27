@@ -179,11 +179,28 @@ class FangcloudFetchWorker(QThread):
                             continue
 
                         url = SEARCH_URL.format(query=urllib.parse.quote(file_name))
-                        page.goto(url, timeout=60000)
                         try:
-                            page.wait_for_selector('li.list-item.search-item',
-                                                   timeout=15000)
-                        except Exception:
+                            # 亿方云是单页应用，打开搜索URL后会再做一次内部跳转，
+                            # goto会报"导航被打断"，忽略之，以结果列表出现为准
+                            page.goto(url, timeout=60000, wait_until='commit')
+                        except Exception as e:
+                            if 'interrupted by another navigation' not in str(e):
+                                raise
+                        found = False
+                        for _ in range(2):
+                            try:
+                                page.wait_for_selector('li.list-item.search-item',
+                                                       timeout=15000)
+                                found = True
+                                break
+                            except Exception:
+                                # 可能被内部跳转带走了，重新进一次搜索页
+                                try:
+                                    page.goto(url, timeout=60000, wait_until='commit')
+                                except Exception as e:
+                                    if 'interrupted by another navigation' not in str(e):
+                                        raise
+                        if not found:
                             self.results['no_match'] += 1
                             result_row['结果'] = '搜索无结果'
                             self.results['records'].append(result_row)
