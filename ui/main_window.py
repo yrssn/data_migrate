@@ -57,6 +57,7 @@ from .image_missing_check_widget import ImageMissingCheckWidget
 from .image_missing_fill_widget import ImageMissingFillWidget
 from .excel_unique_count_widget import ExcelUniqueCountWidget
 from .material_auto_dispatch_widget import MaterialAutoDispatchWidget
+from .fangcloud_fetch_widget import FangcloudFetchWidget
 
 
 class MainWindow(QMainWindow):
@@ -583,6 +584,7 @@ class MainWindow(QMainWindow):
         self.function_combo3.addItem("图片回填", "image_missing_fill")
         self.function_combo3.addItem("Excel唯一值统计", "excel_unique_count")
         self.function_combo3.addItem("资料自动分发", "material_auto_dispatch")
+        self.function_combo3.addItem("云盘资料抓取", "fangcloud_fetch")
         self.function_combo3.currentTextChanged.connect(self.on_function_changed3)
         function_layout.addWidget(self.function_combo3)
 
@@ -609,6 +611,10 @@ class MainWindow(QMainWindow):
         self.material_auto_dispatch_widget = MaterialAutoDispatchWidget()
         self.function_stack3.addWidget(self.material_auto_dispatch_widget)
 
+        # 云盘资料抓取功能
+        self.fangcloud_fetch_widget = FangcloudFetchWidget()
+        self.function_stack3.addWidget(self.fangcloud_fetch_widget)
+
         # 占位页面（其他功能）
         placeholder_widget3 = QWidget()
         placeholder_layout3 = QVBoxLayout()
@@ -634,8 +640,10 @@ class MainWindow(QMainWindow):
             self.function_stack3.setCurrentIndex(2)
         elif "资料自动分发" in text:
             self.function_stack3.setCurrentIndex(3)
-        else:
+        elif "云盘资料抓取" in text:
             self.function_stack3.setCurrentIndex(4)
+        else:
+            self.function_stack3.setCurrentIndex(5)
     
     def load_datasources(self):
         """加载数据源列表"""
