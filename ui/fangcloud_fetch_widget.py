@@ -114,12 +114,28 @@ class FangcloudFetchWorker(QThread):
         row.hover()
         more_btn = row.locator('[data-action="onDropDown"]').first
         more_btn.click()
-        page.wait_for_timeout(400)
-        download_item = page.locator(
-            '.tooltip-popover:visible li:has-text("下载"), '
-            '.popover:visible li:has-text("下载")').first
+        page.wait_for_timeout(600)
+        # 弹出菜单里文字为「下载」的可见项（不依赖菜单容器class）
+        download_item = None
+        for selector in ('[data-action="download"]',
+                         'li:text-is("下载")',
+                         'li:has-text("下载")',
+                         ':text-is("下载")'):
+            candidates = page.locator(selector)
+            for i in range(candidates.count()):
+                item = candidates.nth(i)
+                try:
+                    if item.is_visible():
+                        download_item = item
+                        break
+                except Exception:
+                    continue
+            if download_item is not None:
+                break
+        if download_item is None:
+            raise RuntimeError('弹出菜单里没找到可见的「下载」项')
         with page.expect_download(timeout=60000) as download_info:
-            download_item.click()
+            download_item.click(timeout=10000)
         download = download_info.value
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         download.save_as(dest_path)
