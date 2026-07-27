@@ -5,11 +5,13 @@
 缺失清单.xlsx），用 Playwright 打开亿方云(v2.fangcloud.com)，人工登录后
 按 原文件名 逐条走 文件(夹)名称 搜索(qf=file_name)，结果按归一化相似度
 匹配（法人名出现在路径里加分），相似度最高且达到阈值的下载到
-输出目录/<法人>/<原文件名>，之后直接用「资料自动分发」分发。
+缺失清单对应的 <法人>/<字段备注>/<序号_原文件名>/ 文件夹里（同一文件
+对应多条会复制到每个文件夹），之后直接用「图片回填」生成回传目录。
 登录状态保存在本机浏览器数据目录，下次不用重复登录。
 """
 import os
 import json
+import shutil
 import threading
 import urllib.parse
 import difflib
@@ -43,10 +45,10 @@ class FangcloudFetchWorker(QThread):
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
 
-    def __init__(self, manifest_path, output_dir, threshold=0.6):
+    def __init__(self, manifest_path, threshold=0.6):
         super().__init__()
         self.manifest_path = manifest_path
-        self.output_dir = output_dir
+        self.root_dir = os.path.dirname(os.path.abspath(manifest_path))
         self.threshold = threshold
         self.login_done_event = threading.Event()
         self.stop_requested = False
@@ -67,10 +69,10 @@ class FangcloudFetchWorker(QThread):
         self.login_done_event.set()
 
     def collect_tasks(self):
-        """从缺失清单取 (法人, 原文件名) 去重任务列表"""
+        """从缺失清单按 (法人, 原文件名) 分组，收集每组对应的缺失文件夹"""
         manifest = load_manifest(self.manifest_path)
         tasks = []
-        seen = set()
+        task_map = {}
         for record in manifest.get('missing', []):
             legal_name = str(record.get('legal_name', '') or '未知法人')
             file_name = str(record.get('file_name', '') or '')
@@ -79,11 +81,14 @@ class FangcloudFetchWorker(QThread):
             if not file_name:
                 continue
             key = (legal_name, file_name)
-            if key in seen:
-                continue
-            seen.add(key)
-            tasks.append({'legal_name': legal_name, 'file_name': file_name,
-                          'dept': str(record.get('dept', '') or '')})
+            if key not in task_map:
+                task_map[key] = {'legal_name': legal_name, 'file_name': file_name,
+                                 'dept': str(record.get('dept', '') or ''),
+                                 'folders': []}
+                tasks.append(task_map[key])
+            folder = str(record.get('folder', '') or '')
+            if folder:
+                task_map[key]['folders'].append(folder)
         return tasks
 
     def pick_best_row(self, page, target_name, legal_name):
@@ -113,7 +118,11 @@ class FangcloudFetchWorker(QThread):
         row.scroll_into_view_if_needed()
         row.hover()
         more_btn = row.locator('[data-action="onDropDown"]').first
-        more_btn.click()
+        try:
+            more_btn.click(timeout=5000)
+        except Exception:
+            # 按钮只在悬停时显示，偏移点不到就强制点
+            more_btn.click(force=True, timeout=5000)
         page.wait_for_timeout(600)
         # 弹出菜单里文字为「下载」的可见项（不依赖菜单容器class）
         download_item = None
@@ -174,6 +183,7 @@ class FangcloudFetchWorker(QThread):
                         break
                     legal_name = task['legal_name']
                     file_name = task['file_name']
+                    folders = task['folders']
                     result_row = {
                         '部门': task['dept'],
                         '法人': legal_name,
@@ -183,13 +193,19 @@ class FangcloudFetchWorker(QThread):
                         '保存路径': '',
                         '结果': '',
                     }
-                    dest_path = os.path.join(
-                        self.output_dir, sanitize_name(legal_name),
-                        sanitize_name(file_name, max_len=150))
                     try:
-                        if os.path.isfile(dest_path):
+                        if not folders:
+                            self.results['failed'] += 1
+                            result_row['结果'] = '清单中无对应文件夹，无法落盘'
+                            self.results['records'].append(result_row)
+                            continue
+
+                        safe_name = sanitize_name(file_name, max_len=150)
+                        dest_paths = [os.path.join(self.root_dir, f, safe_name)
+                                      for f in folders]
+                        if all(os.path.isfile(p) for p in dest_paths):
                             self.results['skipped_exists'] += 1
-                            result_row['保存路径'] = dest_path
+                            result_row['保存路径'] = dest_paths[0]
                             result_row['结果'] = '已存在，跳过'
                             self.results['records'].append(result_row)
                             continue
@@ -234,9 +250,12 @@ class FangcloudFetchWorker(QThread):
                                 f"[不匹配] {legal_name} / {file_name} 最高相似度 {score:.2f}")
                             continue
 
-                        self.download_row(page, row, dest_path)
+                        self.download_row(page, row, dest_paths[0])
+                        for extra in dest_paths[1:]:
+                            os.makedirs(os.path.dirname(extra), exist_ok=True)
+                            shutil.copy2(dest_paths[0], extra)
                         self.results['downloaded'] += 1
-                        result_row['保存路径'] = dest_path
+                        result_row['保存路径'] = '; '.join(dest_paths)
                         result_row['结果'] = '已下载'
                         self.results['records'].append(result_row)
                         self.log_message.emit(
@@ -254,8 +273,7 @@ class FangcloudFetchWorker(QThread):
             # 导出抓取报告
             if self.results['records']:
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                report_path = os.path.join(self.output_dir, f'抓取报告_{timestamp}.xlsx')
-                os.makedirs(self.output_dir, exist_ok=True)
+                report_path = os.path.join(self.root_dir, f'抓取报告_{timestamp}.xlsx')
                 pd.DataFrame(self.results['records']).to_excel(
                     report_path, index=False, engine='openpyxl')
                 self.results['report_path'] = report_path
@@ -279,10 +297,10 @@ class FangcloudFetchWidget(QWidget):
         layout = QVBoxLayout()
 
         info_label = QLabel(
-            "使用说明: 选择 缺失清单(json/xlsx) 和输出目录，点「打开浏览器抓取」会弹出浏览器，"
-            "在浏览器里登录亿方云后回来点「已登录，开始抓取」。工具按原文件名走 文件(夹)名称 搜索，"
-            "相似度最高（法人名出现在路径里加分）且达到阈值的下载到 输出目录/法人/原文件名，"
-            "完成后用「资料自动分发」分发即可。登录状态会保存，下次无需重复登录。")
+            "使用说明: 选择 缺失清单(json/xlsx)（需和缺失文件夹在同一目录），点「打开浏览器抓取」"
+            "会弹出浏览器，在浏览器里登录亿方云后回来点「已登录，开始抓取」。工具按原文件名走 文件(夹)名称 搜索，"
+            "相似度最高（法人名出现在路径里加分）且达到阈值的下载到清单对应的 法人/字段备注/序号_原文件名/ 文件夹，"
+            "完成后直接用「图片回填」生成回传目录即可。登录状态会保存，下次无需重复登录。")
         info_label.setWordWrap(True)
         info_label.setStyleSheet("color: #666;")
         layout.addWidget(info_label)
@@ -298,15 +316,6 @@ class FangcloudFetchWidget(QWidget):
         manifest_layout.addWidget(self.manifest_edit)
         manifest_layout.addWidget(self.select_manifest_btn)
         form_layout.addRow("缺失清单:", manifest_layout)
-
-        output_layout = QHBoxLayout()
-        self.output_dir_edit = QLineEdit()
-        self.output_dir_edit.setReadOnly(True)
-        self.select_output_btn = QPushButton("选择输出目录")
-        self.select_output_btn.clicked.connect(self.select_output_dir)
-        output_layout.addWidget(self.output_dir_edit)
-        output_layout.addWidget(self.select_output_btn)
-        form_layout.addRow("输出目录:", output_layout)
 
         self.threshold_spin = QDoubleSpinBox()
         self.threshold_spin.setRange(0.1, 1.0)
@@ -361,19 +370,10 @@ class FangcloudFetchWidget(QWidget):
         if file_path:
             self.manifest_edit.setText(file_path)
 
-    def select_output_dir(self):
-        dir_path = QFileDialog.getExistingDirectory(self, "选择输出目录")
-        if dir_path:
-            self.output_dir_edit.setText(dir_path)
-
     def start_fetch(self):
         manifest_path = self.manifest_edit.text().strip()
-        output_dir = self.output_dir_edit.text().strip()
         if not manifest_path:
             QMessageBox.warning(self, "提示", "请选择缺失清单(json或xlsx)")
-            return
-        if not output_dir:
-            QMessageBox.warning(self, "提示", "请选择输出目录")
             return
 
         self.result_table.setRowCount(0)
@@ -383,7 +383,7 @@ class FangcloudFetchWidget(QWidget):
         self.stop_btn.setEnabled(True)
 
         self.worker = FangcloudFetchWorker(
-            manifest_path, output_dir, self.threshold_spin.value())
+            manifest_path, self.threshold_spin.value())
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log_message.connect(self.log)
         self.worker.login_ready.connect(self.on_login_ready)
