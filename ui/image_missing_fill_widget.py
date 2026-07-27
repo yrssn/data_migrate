@@ -3,9 +3,10 @@
 
 配合「图片丢失检查」使用：业务把补充的图片放进检查生成的
 缺失_<表名>_<时间戳>/<法人>/<字段备注>/<序号_原文件名>/ 文件夹后，
-本功能读取 缺失清单.json，扫描各文件夹中的图片，不管业务给的文件名
-和类型是什么，一律按数据库里原有的 url/文件名（含扩展名）重命名，
-生成 uploads/<年>/<月>/<日>/ 目录结构，直接上传到服务器即可，
+本功能读取 缺失清单.json（或 缺失清单.xlsx），扫描各文件夹中的图片，
+不管业务给的文件名和类型是什么，一律按数据库里原有的 url/文件名
+（含扩展名）重命名，严格按原URL的路径生成目录结构（uploads/年/月/日
+或 storage/default/日期 等任意结构都支持），直接上传到服务器即可，
 数据库数据完全不动。
 """
 import os
@@ -22,6 +23,45 @@ import pandas as pd
 
 
 IGNORED_FILES = {'说明.txt', 'thumbs.db', 'desktop.ini', '.ds_store'}
+
+# 缺失清单.xlsx 列名 → 清单字段名（与图片丢失检查导出的Excel列对应）
+EXCEL_COLUMN_MAP = {
+    '行ID': 'row_id',
+    '部门': 'dept',
+    '法人': 'legal_name',
+    '字段名': 'field_name',
+    '字段备注': 'field_comment',
+    '数组位置(从0开始)': 'index',
+    '原文件名': 'file_name',
+    '原URL': 'url',
+    'uid': 'uid',
+    '对应文件夹': 'folder',
+}
+
+
+def load_manifest(manifest_path: str) -> dict:
+    """加载缺失清单，支持 json 和 Excel（图片丢失检查导出的 缺失清单.xlsx）"""
+    if manifest_path.lower().endswith(('.xlsx', '.xls')):
+        df = pd.read_excel(manifest_path, dtype=str)
+        df = df.rename(columns=EXCEL_COLUMN_MAP)
+        if 'url' not in df.columns:
+            raise ValueError("Excel中找不到「原URL」列，请选择图片丢失检查导出的 缺失清单.xlsx")
+        missing = []
+        for _, row in df.iterrows():
+            record = {}
+            for key in ('row_id', 'dept', 'legal_name', 'field_name',
+                        'field_comment', 'file_name', 'url', 'uid', 'folder'):
+                value = row.get(key)
+                record[key] = '' if value is None or pd.isna(value) else str(value)
+            index_value = row.get('index')
+            try:
+                record['index'] = int(float(index_value))
+            except (TypeError, ValueError):
+                record['index'] = 0
+            missing.append(record)
+        return {'table': '', 'missing': missing}
+    with open(manifest_path, 'r', encoding='utf-8') as f:
+        return json.load(f)
 
 
 class ImageMissingFillWorker(QThread):
@@ -57,8 +97,7 @@ class ImageMissingFillWorker(QThread):
 
     def run(self):
         try:
-            with open(self.manifest_path, 'r', encoding='utf-8') as f:
-                manifest = json.load(f)
+            manifest = load_manifest(self.manifest_path)
 
             table = manifest.get('table', '')
             missing = manifest.get('missing', [])
@@ -203,8 +242,9 @@ class ImageMissingFillWidget(QWidget):
 
         info_label = QLabel(
             "使用说明: 先用「图片丢失检查」生成缺失文件夹，业务把补充的图片放进对应文件夹"
-            "（每个文件夹放一张，文件名和类型随意），然后在这里选择 缺失清单.json，"
-            "工具会按数据库里原有的url和文件名重命名，生成 uploads/年/月/日/ 目录结构，"
+            "（每个文件夹放一张，文件名和类型随意），然后在这里选择 缺失清单.json 或 缺失清单.xlsx"
+            "（需和缺失文件夹在同一目录），工具会按数据库里原有的url和文件名重命名，"
+            "严格按原URL路径生成目录结构（uploads/年/月/日 或 storage/default/日期 等都支持），"
             "直接上传到服务器即可，数据库数据不会被修改。")
         info_label.setWordWrap(True)
         info_label.setStyleSheet("color: #666;")
@@ -216,7 +256,7 @@ class ImageMissingFillWidget(QWidget):
         manifest_layout = QHBoxLayout()
         self.manifest_edit = QLineEdit()
         self.manifest_edit.setReadOnly(True)
-        self.select_manifest_btn = QPushButton("选择缺失清单.json")
+        self.select_manifest_btn = QPushButton("选择缺失清单(json/xlsx)")
         self.select_manifest_btn.clicked.connect(self.select_manifest)
         manifest_layout.addWidget(self.manifest_edit)
         manifest_layout.addWidget(self.select_manifest_btn)
@@ -229,13 +269,13 @@ class ImageMissingFillWidget(QWidget):
         self.select_output_btn.clicked.connect(self.select_output_dir)
         output_layout.addWidget(self.output_dir_edit)
         output_layout.addWidget(self.select_output_btn)
-        form_layout.addRow("uploads输出目录:", output_layout)
+        form_layout.addRow("输出目录:", output_layout)
 
         config_group.setLayout(form_layout)
         layout.addWidget(config_group)
 
         btn_layout = QHBoxLayout()
-        self.start_btn = QPushButton("开始生成uploads目录")
+        self.start_btn = QPushButton("开始生成回填目录")
         self.start_btn.clicked.connect(self.start_fill)
         btn_layout.addWidget(self.start_btn)
         btn_layout.addStretch()
@@ -267,12 +307,12 @@ class ImageMissingFillWidget(QWidget):
 
     def select_manifest(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "选择缺失清单.json", "", "JSON文件 (*.json)")
+            self, "选择缺失清单", "", "缺失清单 (*.json *.xlsx *.xls)")
         if file_path:
             self.manifest_edit.setText(file_path)
 
     def select_output_dir(self):
-        dir_path = QFileDialog.getExistingDirectory(self, "选择uploads输出目录")
+        dir_path = QFileDialog.getExistingDirectory(self, "选择输出目录")
         if dir_path:
             self.output_dir_edit.setText(dir_path)
 
@@ -281,10 +321,10 @@ class ImageMissingFillWidget(QWidget):
         output_dir = self.output_dir_edit.text().strip()
 
         if not manifest_path:
-            QMessageBox.warning(self, "提示", "请选择缺失清单.json")
+            QMessageBox.warning(self, "提示", "请选择缺失清单(json或xlsx)")
             return
         if not output_dir:
-            QMessageBox.warning(self, "提示", "请选择uploads输出目录")
+            QMessageBox.warning(self, "提示", "请选择输出目录")
             return
 
         self.result_table.setRowCount(0)
