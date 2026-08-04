@@ -65,7 +65,8 @@ class BankCardLinkWorker(QThread):
             'skip_count': 0,
             'fail_count': 0,
             'completed_data': [],
-            'failed_records': []
+            'failed_records': [],
+            'unlinked_target': []
         }
         self.reason_stats = Counter()
 
@@ -415,6 +416,48 @@ class BankCardLinkWorker(QThread):
 
                 self.progress.emit(15 + int((index + 1) / total * 80))
 
+            # ---------- 进销存侧未关联的记录（供导出排查） ----------
+            ea_by_account = {}
+            for ea in ea_rows:
+                ea_by_account.setdefault(norm_account(ea['account']), []).append(ea)
+
+            target_cursor.execute("""
+                SELECT b.id, b.bank_id, b.rlb_customer_id, b.bank_card_type,
+                       b.account_classify_id, b.status, b.bank_balance, b.finance_card_id,
+                       c.legal_name, n.bank_name
+                FROM ba_zhb_bank b
+                LEFT JOIN ba_rlb_customer c ON c.id = b.rlb_customer_id
+                LEFT JOIN ba_zhb_bank_name n ON n.id = b.bank_name_id
+                WHERE (b.delete_time IS NULL OR b.delete_time = 0)
+                  AND b.finance_card_id IS NULL
+                ORDER BY b.id ASC
+            """)
+            for row in target_cursor.fetchall():
+                if self.preview_only and row['id'] in used_ba_ids:
+                    continue  # 预检查时这些本次会被关联上
+                same_account = ea_by_account.get(norm_account(row['bank_id']), [])
+                if same_account:
+                    ea_hit = same_account[0]
+                    note = (f"财务有相同卡号(财务卡ID={ea_hit['id']},法人="
+                            f"{ea_legal_name.get(ea_hit['legal_id'], '') or '?'})但本次未绑定"
+                            f"，可能已被另一条进销存记录占用")
+                else:
+                    note = '财务系统没有这个卡号'
+                self.results['unlinked_target'].append({
+                    '进销存银行卡ID': row['id'],
+                    '卡号': row['bank_id'],
+                    '法人': row['legal_name'] or '',
+                    '银行名称': row['bank_name'] or '',
+                    '银行卡类型': row['bank_card_type'],
+                    '账户分类ID': row['account_classify_id'],
+                    '状态': row['status'],
+                    '余额': row['bank_balance'],
+                    '未关联原因': note,
+                })
+            self.log_message.emit(
+                f"进销存仍未关联财务的银行卡: {len(self.results['unlinked_target'])} 张（可导出）"
+            )
+
             source_cursor.close()
             source_conn.close()
             target_cursor.close()
@@ -454,6 +497,7 @@ class BankCardLinkWidget(QWidget):
         self.worker = None
         self.completed_data = []
         self.failed_records = []
+        self.unlinked_target = []
         self.init_ui()
         self.load_datasources()
 
@@ -497,7 +541,9 @@ class BankCardLinkWidget(QWidget):
 • 匹配上：回写 finance_card_id，并把账户分类、银行卡类型、银行名称、币种、状态、余额
 全部刷成财务的（以财务为准，只改有差异的字段）<br>
 • 匹配不上：新增 ba_zhb_bank 并直接绑定（银行名称/币种/类型/状态/余额/账户分类一并写入）<br>
-• 匹配不上且进销存没有该法人/该银行名称：不新增，计入跳过并写入待处理清单（可导出）<br><br>
+• 匹配不上且进销存没有该法人/该银行名称：不新增，计入跳过并写入待处理清单（可导出）<br>
+• 跑完可用「导出进销存未关联记录」导出 ba_zhb_bank 中 finance_card_id 仍为空的卡，
+并标注该卡号在财务是否存在、存在时是哪张卡/哪个法人<br><br>
 <b>字段映射:</b><br>
 • bank_name_id: ea_dy_legal_cards.bankcard_id → ba_zhb_bank_name.finance_bankcard_id，
 退化为按银行名称匹配<br>
@@ -536,6 +582,11 @@ ba_account_classify.finance_classify_id，退化为按分类名称匹配<br>
         self.export_failed_btn.setEnabled(False)
         self.export_failed_btn.clicked.connect(self.export_failed)
         btn_layout.addWidget(self.export_failed_btn)
+
+        self.export_unlinked_btn = QPushButton("导出进销存未关联记录")
+        self.export_unlinked_btn.setEnabled(False)
+        self.export_unlinked_btn.clicked.connect(self.export_unlinked)
+        btn_layout.addWidget(self.export_unlinked_btn)
 
         layout.addLayout(btn_layout)
 
@@ -643,6 +694,8 @@ ba_account_classify.finance_classify_id，退化为按分类名称匹配<br>
         self.log_text.clear()
         self.completed_data = []
         self.failed_records = []
+        self.unlinked_target = []
+        self.export_unlinked_btn.setEnabled(False)
 
         self.worker = BankCardLinkWorker(target_ds, source_ds, preview_only=preview_only)
         self.worker.progress.connect(self.progress_bar.setValue)
@@ -662,6 +715,7 @@ ba_account_classify.finance_classify_id，退化为按分类名称匹配<br>
 
         self.completed_data = results.get('completed_data', [])
         self.failed_records = results.get('failed_records', [])
+        self.unlinked_target = results.get('unlinked_target', [])
 
         text = (f"财务银行卡{results['total']}张 | 关联: {results['bind_count']} | "
                 f"新增并关联: {results['insert_count']} | 改分类: {results['classify_update_count']} | "
@@ -672,6 +726,7 @@ ba_account_classify.finance_classify_id，退化为按分类名称匹配<br>
 
         self.export_completed_btn.setEnabled(len(self.completed_data) > 0)
         self.export_failed_btn.setEnabled(len(self.failed_records) > 0)
+        self.export_unlinked_btn.setEnabled(len(self.unlinked_target) > 0)
 
     def on_error(self, error_msg):
         self.precheck_btn.setEnabled(True)
@@ -691,6 +746,16 @@ ba_account_classify.finance_classify_id，退化为按分类名称匹配<br>
         if path:
             pd.DataFrame(self.completed_data).to_excel(path, index=False, engine='openpyxl')
             QMessageBox.information(self, "成功", f"已导出 {len(self.completed_data)} 条记录到:\n{path}")
+
+    def export_unlinked(self):
+        if not self.unlinked_target:
+            QMessageBox.warning(self, "警告", "没有未关联记录！")
+            return
+        default_name = f"进销存未关联银行卡_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        path, _ = QFileDialog.getSaveFileName(self, "保存进销存未关联记录", default_name, "Excel文件 (*.xlsx)")
+        if path:
+            pd.DataFrame(self.unlinked_target).to_excel(path, index=False, engine='openpyxl')
+            QMessageBox.information(self, "成功", f"已导出 {len(self.unlinked_target)} 条记录到:\n{path}")
 
     def export_failed(self):
         if not self.failed_records:
