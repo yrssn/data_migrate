@@ -200,16 +200,14 @@ class BankCardLinkWorker(QThread):
                 ORDER BY id ASC
             """)
             ba_rows = target_cursor.fetchall()
-            ba_by_key = {}
             ba_by_account = {}
             for row in ba_rows:
-                acct = norm_account(row['bank_id'])
-                ba_by_key.setdefault((row['rlb_customer_id'], acct), []).append(row)
-                ba_by_account.setdefault(acct, []).append(row)
+                ba_by_account.setdefault(norm_account(row['bank_id']), []).append(row)
             self.log_message.emit(f"进销存现有 {len(ba_rows)} 张银行卡")
             self.progress.emit(15)
 
             used_ba_ids = set()
+            bound_ba_by_account = {}
             now = int(datetime.now().timestamp())
 
             for index, ea in enumerate(ea_rows):
@@ -259,23 +257,38 @@ class BankCardLinkWorker(QThread):
                     if abs(Decimal(balance)) > MAX_BALANCE:
                         balance = None  # 超出进销存字段范围，不同步余额
 
-                    # 先按「法人+卡号」匹配，匹不上退化为「卡号」匹配
+                    # 按卡号匹配，同卡号有多条时按「法人/银行名称/卡类型」打分选最优
+                    same_account_rows = ba_by_account.get(acct_key, [])
+                    candidates = [r for r in same_account_rows if r['id'] not in used_ba_ids]
                     match_note = ''
-                    candidates = [
-                        r for r in ba_by_key.get((customer_id, acct_key), [])
-                        if r['id'] not in used_ba_ids
-                    ] if customer_id else []
-                    if not candidates:
-                        loose = [r for r in ba_by_account.get(acct_key, []) if r['id'] not in used_ba_ids]
-                        if loose:
-                            candidates = loose
-                            other_legal = ba_customer_name.get(loose[0]['rlb_customer_id'], '')
-                            match_note = f"[仅卡号匹配,进销存法人={other_legal or '空'}]"
+                    if len(same_account_rows) > 1:
+                        match_note = f"[进销存同卡号有{len(same_account_rows)}条]"
 
                     if candidates:
-                        self.reason_stats['仅卡号匹配' if match_note else '法人+卡号匹配'] += 1
+                        def score(row):
+                            value = 0
+                            if customer_id and row['rlb_customer_id'] == customer_id:
+                                value += 8
+                            if bank_name_id and row['bank_name_id'] == bank_name_id:
+                                value += 4
+                            if row['bank_card_type'] == card_type:
+                                value += 2
+                            if row['finance_card_id'] == ea['id']:
+                                value += 16
+                            elif row['finance_card_id']:
+                                value -= 1  # 已绑定到其他财务卡的尽量不动
+                            return value
+
+                        candidates.sort(key=score, reverse=True)
+                        if customer_id and candidates[0]['rlb_customer_id'] == customer_id:
+                            self.reason_stats['法人+卡号匹配'] += 1
+                        else:
+                            other_legal = ba_customer_name.get(candidates[0]['rlb_customer_id'], '')
+                            match_note += f"[仅卡号匹配,进销存法人={other_legal or '空'}]"
+                            self.reason_stats['仅卡号匹配'] += 1
                         ba_row = candidates[0]
                         used_ba_ids.add(ba_row['id'])
+                        bound_ba_by_account[acct_key] = ba_row['id']
                         result_row['进销存银行卡ID'] = ba_row['id']
                         result_row['原关联财务ID'] = ba_row['finance_card_id'] or ''
 
@@ -365,7 +378,8 @@ class BankCardLinkWorker(QThread):
                     # 进销存没有 → 新增并绑定（需法人和银行名称都能对上）
                     if not customer_id:
                         self.results['skip_count'] += 1
-                        reason = '进销存没有该法人' if legal_name else '财务法人不存在'
+                        reason = '进销存无此卡号且无此法人,未新增' if legal_name \
+                            else '财务法人不存在,未新增'
                         self.reason_stats[reason] += 1
                         result_row['处理状态'] = f'跳过未新增({reason}: {legal_name or ea["legal_id"]})'
                         self.results['completed_data'].append(result_row)
@@ -374,7 +388,7 @@ class BankCardLinkWorker(QThread):
 
                     if not bank_name_id:
                         self.results['skip_count'] += 1
-                        self.reason_stats['进销存没有该银行名称'] += 1
+                        self.reason_stats['进销存没有该银行名称,未新增'] += 1
                         result_row['处理状态'] = f'跳过未新增(进销存没有该银行名称: {bank_name}，请先跑银行名称关联)'
                         self.results['completed_data'].append(result_row)
                         self.results['failed_records'].append(result_row)
@@ -435,12 +449,19 @@ class BankCardLinkWorker(QThread):
             for row in target_cursor.fetchall():
                 if self.preview_only and row['id'] in used_ba_ids:
                     continue  # 预检查时这些本次会被关联上
-                same_account = ea_by_account.get(norm_account(row['bank_id']), [])
+                acct = norm_account(row['bank_id'])
+                same_account = ea_by_account.get(acct, [])
                 if same_account:
                     ea_hit = same_account[0]
-                    note = (f"财务有相同卡号(财务卡ID={ea_hit['id']},法人="
-                            f"{ea_legal_name.get(ea_hit['legal_id'], '') or '?'})但本次未绑定"
-                            f"，可能已被另一条进销存记录占用")
+                    hit_desc = (f"财务卡ID={ea_hit['id']},法人="
+                                f"{ea_legal_name.get(ea_hit['legal_id'], '') or '?'}")
+                    bound_id = bound_ba_by_account.get(acct)
+                    dup_count = len(ba_by_account.get(acct, []))
+                    if bound_id and bound_id != row['id']:
+                        note = (f"进销存同卡号有{dup_count}条重复记录，该财务卡({hit_desc})"
+                                f"已绑到进销存ID={bound_id}，一张财务卡只能绑一条")
+                    else:
+                        note = f"财务有相同卡号({hit_desc})但本次未绑定，需排查"
                 else:
                     note = '财务系统没有这个卡号'
                 self.results['unlinked_target'].append({
@@ -536,7 +557,8 @@ class BankCardLinkWidget(QWidget):
 <b>处理逻辑:</b><br>
 • 遍历财务库 ea_dy_legal_cards 中未删除的银行卡<br>
 • legal_id → ea_dy_legal.name → 进销存 ba_rlb_customer.legal_name 得到 rlb_customer_id<br>
-• 先按「法人 + 卡号」匹配 ba_zhb_bank，匹不上退化为「卡号」匹配并在结果里标注进销存当前法人<br>
+• 按卡号匹配 ba_zhb_bank，同一卡号有多条时按「法人/银行名称/卡类型」打分选最优那条，
+法人对不上时仍关联并标注进销存当前法人（一张财务卡只能绑一条进销存记录）<br>
 • 卡号匹配时忽略空格/横线等分隔符，法人名忽略空白<br>
 • 匹配上：回写 finance_card_id，并把账户分类、银行卡类型、银行名称、币种、状态、余额
 全部刷成财务的（以财务为准，只改有差异的字段）<br>
