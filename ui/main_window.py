@@ -60,6 +60,7 @@ from .material_auto_dispatch_widget import MaterialAutoDispatchWidget
 from .fangcloud_fetch_widget import FangcloudFetchWidget
 from .account_classify_link_widget import AccountClassifyLinkWidget
 from .bank_name_link_widget import BankNameLinkWidget
+from .bank_card_link_widget import BankCardLinkWidget
 
 
 class MainWindow(QMainWindow):
@@ -428,6 +429,7 @@ class MainWindow(QMainWindow):
         self.function_combo2.addItem("银行表补充注册表ID", "zhb_bank_register_fill")
         self.function_combo2.addItem("账户分类关联财务系统", "account_classify_link")
         self.function_combo2.addItem("银行名称关联财务系统", "bank_name_link")
+        self.function_combo2.addItem("银行卡关联财务系统", "bank_card_link")
         self.function_combo2.currentTextChanged.connect(self.on_function_changed2)
         function_layout.addWidget(self.function_combo2)
 
@@ -520,6 +522,10 @@ class MainWindow(QMainWindow):
         self.bank_name_link_widget = BankNameLinkWidget(self.db_manager)
         self.function_stack2.addWidget(self.bank_name_link_widget)
 
+        # 银行卡关联财务系统
+        self.bank_card_link_widget = BankCardLinkWidget(self.db_manager)
+        self.function_stack2.addWidget(self.bank_card_link_widget)
+
 
         # 占位页面（其他功能）
         placeholder_widget = QWidget()
@@ -580,8 +586,10 @@ class MainWindow(QMainWindow):
             self.function_stack2.setCurrentIndex(19)
         elif "银行名称关联财务系统" in text:
             self.function_stack2.setCurrentIndex(20)
-        else:
+        elif "银行卡关联财务系统" in text:
             self.function_stack2.setCurrentIndex(21)
+        else:
+            self.function_stack2.setCurrentIndex(22)
 
     def create_migration_tab3(self) -> QWidget:
         """创建迁移任务3标签页"""
