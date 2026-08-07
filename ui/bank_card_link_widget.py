@@ -102,14 +102,17 @@ class BankCardLinkWorker(QThread):
             source_cursor.execute("SELECT id, code FROM ea_dy_currency")
             ea_currency_code = {r['id']: (r['code'] or '').strip() for r in source_cursor.fetchall()}
 
-            # 进销存币种：currency_en → id
+            # 进销存币种：财务货币ID → id（优先），currency_en → id（兜底）
             target_cursor.execute("""
-                SELECT id, currency_en FROM ba_currency
+                SELECT id, currency_en, finance_currency_id FROM ba_currency
                 WHERE (delete_time IS NULL OR delete_time = 0)
             """)
             ba_currency_by_code = {}
+            ba_currency_by_finance_id = {}
             for r in target_cursor.fetchall():
                 ba_currency_by_code.setdefault((r['currency_en'] or '').strip(), r['id'])
+                if r['finance_currency_id']:
+                    ba_currency_by_finance_id.setdefault(r['finance_currency_id'], r['id'])
 
             # 财务法人
             source_cursor.execute("""
@@ -250,7 +253,9 @@ class BankCardLinkWorker(QThread):
                     if not bank_name_id and bank_name:
                         bank_name_id = ba_bank_name_by_name.get(norm_name(bank_name))
                     currency_code = ea_currency_code.get(ea['currency_id'], '')
-                    currency_id = ba_currency_by_code.get(currency_code)
+                    # 优先按货币绑定ID关联（依赖「货币关联财务系统」），取不到再按代码
+                    currency_id = ba_currency_by_finance_id.get(ea['currency_id']) \
+                        or ba_currency_by_code.get(currency_code)
                     card_type = FINANCE_CARD_TYPE_MAP.get(ea['bank_card_type'], 'opt2')
                     status = 1 if ea['status'] is None else int(ea['status'])
                     balance = ea['balance'] if ea['balance'] is not None else Decimal('0.00')

@@ -58,6 +58,7 @@ from .image_missing_fill_widget import ImageMissingFillWidget
 from .excel_unique_count_widget import ExcelUniqueCountWidget
 from .material_auto_dispatch_widget import MaterialAutoDispatchWidget
 from .fangcloud_fetch_widget import FangcloudFetchWidget
+from .currency_link_widget import CurrencyLinkWidget
 from .account_classify_link_widget import AccountClassifyLinkWidget
 from .bank_name_link_widget import BankNameLinkWidget
 from .bank_card_link_widget import BankCardLinkWidget
@@ -427,6 +428,7 @@ class MainWindow(QMainWindow):
         self.function_combo2.addItem("软删除工具", "soft_delete")
         self.function_combo2.addItem("注册表银行数据导出", "ptzcb_bank_export")
         self.function_combo2.addItem("银行表补充注册表ID", "zhb_bank_register_fill")
+        self.function_combo2.addItem("货币关联财务系统", "currency_link")
         self.function_combo2.addItem("账户分类关联财务系统", "account_classify_link")
         self.function_combo2.addItem("银行名称关联财务系统", "bank_name_link")
         self.function_combo2.addItem("银行卡关联财务系统", "bank_card_link")
@@ -514,6 +516,10 @@ class MainWindow(QMainWindow):
         self.zhb_bank_register_fill_widget = ZhbBankRegisterFillWidget(self.db_manager)
         self.function_stack2.addWidget(self.zhb_bank_register_fill_widget)
 
+        # 货币关联财务系统
+        self.currency_link_widget = CurrencyLinkWidget(self.db_manager)
+        self.function_stack2.addWidget(self.currency_link_widget)
+
         # 账户分类关联财务系统
         self.account_classify_link_widget = AccountClassifyLinkWidget(self.db_manager)
         self.function_stack2.addWidget(self.account_classify_link_widget)
@@ -582,14 +588,16 @@ class MainWindow(QMainWindow):
             self.function_stack2.setCurrentIndex(17)
         elif "银行表补充注册表ID" in text:
             self.function_stack2.setCurrentIndex(18)
-        elif "账户分类关联财务系统" in text:
+        elif "货币关联财务系统" in text:
             self.function_stack2.setCurrentIndex(19)
-        elif "银行名称关联财务系统" in text:
+        elif "账户分类关联财务系统" in text:
             self.function_stack2.setCurrentIndex(20)
-        elif "银行卡关联财务系统" in text:
+        elif "银行名称关联财务系统" in text:
             self.function_stack2.setCurrentIndex(21)
-        else:
+        elif "银行卡关联财务系统" in text:
             self.function_stack2.setCurrentIndex(22)
+        else:
+            self.function_stack2.setCurrentIndex(23)
 
     def create_migration_tab3(self) -> QWidget:
         """创建迁移任务3标签页"""

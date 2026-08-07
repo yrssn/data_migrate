@@ -1,14 +1,12 @@
 """
-银行名称关联财务系统
+货币关联财务系统
 
-以财务系统 ea_dy_bankcard 为主，按名称关联进销存 ba_zhb_bank_name：
-- 名称能匹配上：回写 ba_zhb_bank_name.finance_bankcard_id，并按财务的账户分类同步 account_classify_id、
-  按财务银行名称上的货币同步 currency_id（货币是挂在银行卡名称上的）
-- 名称匹配不上：在进销存新增一条并直接绑定
+以财务系统 ea_dy_currency 为主，按货币代码(code)关联进销存 ba_currency：
+- 代码能匹配上(其次按中文名)：回写 ba_currency.finance_currency_id
+- 匹配不上：在进销存新增一条并直接绑定
 
-依赖「账户分类关联财务系统」「货币关联财务系统」的结果
-（通过 ba_account_classify.finance_classify_id / ba_currency.finance_currency_id 做映射），
-请先跑完这两个再跑本功能。
+本功能和「账户分类关联财务系统」一样是最先要跑的，
+「银行名称关联财务系统」会依赖这里的 finance_currency_id 把财务银行名称上的货币刷到进销存。
 """
 from datetime import datetime
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
@@ -21,8 +19,8 @@ import pandas as pd
 import pymysql
 
 
-class BankNameLinkWorker(QThread):
-    """银行名称关联工作线程"""
+class CurrencyLinkWorker(QThread):
+    """货币关联工作线程"""
     progress = pyqtSignal(int)
     log_message = pyqtSignal(str)
     finished = pyqtSignal(dict)
@@ -37,8 +35,6 @@ class BankNameLinkWorker(QThread):
             'total': 0,
             'bind_count': 0,
             'insert_count': 0,
-            'classify_update_count': 0,
-            'currency_update_count': 0,
             'skip_count': 0,
             'fail_count': 0,
             'completed_data': [],
@@ -72,212 +68,105 @@ class BankNameLinkWorker(QThread):
             target_conn = self._connect(self.target_datasource)
             target_cursor = target_conn.cursor(pymysql.cursors.DictCursor)
 
-            # 财务账户分类ID → 名称（用于日志和兜底按名称匹配）
-            source_cursor.execute("""
-                SELECT id, name FROM ea_dy_account_classify
-                WHERE (delete_time IS NULL OR delete_time = 0)
-            """)
-            ea_classify_name = {r['id']: (r['name'] or '').strip() for r in source_cursor.fetchall()}
-
-            # 进销存账户分类：财务ID → 进销存ID，名称 → 进销存ID
-            target_cursor.execute("""
-                SELECT id, name, finance_classify_id FROM ba_account_classify
-                WHERE (delete_time IS NULL OR delete_time = 0)
-            """)
-            ba_classify_by_finance_id = {}
-            ba_classify_by_name = {}
-            for r in target_cursor.fetchall():
-                if r['finance_classify_id']:
-                    ba_classify_by_finance_id.setdefault(r['finance_classify_id'], r['id'])
-                ba_classify_by_name.setdefault((r['name'] or '').strip(), r['id'])
-            self.log_message.emit(
-                f"进销存账户分类已关联财务的有 {len(ba_classify_by_finance_id)} 条"
-            )
-
-            # 财务币种
-            source_cursor.execute("SELECT id, name, code FROM ea_dy_currency")
-            ea_currency_rows = source_cursor.fetchall()
-            ea_currency_code = {r['id']: (r['code'] or '') for r in ea_currency_rows}
-            ea_currency_name = {r['id']: (r['name'] or '') for r in ea_currency_rows}
-
-            # 进销存货币：财务ID → 进销存ID，代码 → 进销存ID（依赖「货币关联财务系统」先跑）
-            target_cursor.execute("""
-                SELECT id, currency_cn, currency_en, finance_currency_id
-                FROM ba_currency
-                WHERE (delete_time IS NULL OR delete_time = 0)
-            """)
-            ba_currency_by_finance_id = {}
-            ba_currency_by_code = {}
-            for r in target_cursor.fetchall():
-                if r['finance_currency_id']:
-                    ba_currency_by_finance_id.setdefault(r['finance_currency_id'], r['id'])
-                ba_currency_by_code.setdefault((r['currency_en'] or '').strip().upper(), r['id'])
-            self.log_message.emit(
-                f"进销存货币已关联财务的有 {len(ba_currency_by_finance_id)} 条"
-            )
-
-            # 财务银行名称（以它为主）
-            source_cursor.execute("""
-                SELECT id, name, currency_id, account_classify, status, remark
-                FROM ea_dy_bankcard
-                WHERE (delete_time IS NULL OR delete_time = 0)
-                ORDER BY id ASC
-            """)
+            # 财务货币（以它为主）。ea_dy_currency 只有 id/name/code，没有时间字段
+            source_cursor.execute("SELECT id, name, code FROM ea_dy_currency ORDER BY id ASC")
             ea_rows = source_cursor.fetchall()
             total = len(ea_rows)
             self.results['total'] = total
-            self.log_message.emit(f"财务系统共 {total} 条银行名称")
+            self.log_message.emit(f"财务系统共 {total} 条货币")
 
             if total == 0:
                 self.progress.emit(100)
                 self.finished.emit(self.results)
                 return
 
-            # 进销存现有银行名称
+            # 进销存现有货币（代码/中文名各建一份索引，代码不区分大小写）
             target_cursor.execute("""
-                SELECT id, bank_name, account_classify_id, currency_id, finance_bankcard_id
-                FROM ba_zhb_bank_name
+                SELECT id, currency_cn, currency_en, finance_currency_id
+                FROM ba_currency
                 WHERE (delete_time IS NULL OR delete_time = 0)
                 ORDER BY id ASC
             """)
             ba_rows = target_cursor.fetchall()
+            ba_by_code = {}
             ba_by_name = {}
             for row in ba_rows:
-                ba_by_name.setdefault((row['bank_name'] or '').strip(), []).append(row)
-            self.log_message.emit(f"进销存现有 {len(ba_rows)} 条银行名称")
+                ba_by_code.setdefault((row['currency_en'] or '').strip().upper(), []).append(row)
+                ba_by_name.setdefault((row['currency_cn'] or '').strip(), []).append(row)
+            self.log_message.emit(f"进销存现有 {len(ba_rows)} 条货币")
             self.progress.emit(15)
 
             used_ba_ids = set()
             now = int(datetime.now().timestamp())
 
             for index, ea in enumerate(ea_rows):
+                code = (ea['code'] or '').strip()
                 name = (ea['name'] or '').strip()
-                classify_name = ea_classify_name.get(ea['account_classify'], '')
                 result_row = {
-                    '财务银行ID': ea['id'],
-                    '财务银行名称': name,
-                    '财务账户分类ID': ea['account_classify'] or '',
-                    '财务账户分类名称': classify_name,
-                    '财务货币ID': ea['currency_id'] or '',
-                    '财务货币代码': ea_currency_code.get(ea['currency_id'], ''),
-                    '进销存银行名称ID': '',
-                    '进销存账户分类ID': '',
+                    '财务货币ID': ea['id'],
+                    '财务货币代码': code,
+                    '财务货币名称': name,
                     '进销存货币ID': '',
                     '原关联财务ID': '',
                 }
                 try:
-                    if not name:
+                    if not code and not name:
                         self.results['skip_count'] += 1
-                        result_row['处理状态'] = '跳过(财务银行名称为空)'
+                        result_row['处理状态'] = '跳过(财务代码和名称都为空)'
                         self.results['completed_data'].append(result_row)
                         continue
 
-                    # 账户分类映射：优先按财务分类ID关联，其次按分类名称
-                    ba_classify_id = ba_classify_by_finance_id.get(ea['account_classify'])
-                    if not ba_classify_id and classify_name:
-                        ba_classify_id = ba_classify_by_name.get(classify_name)
-                    result_row['进销存账户分类ID'] = ba_classify_id or ''
-                    classify_warn = ''
-                    if not ba_classify_id:
-                        classify_warn = f"[账户分类未匹配:{ea['account_classify']}/{classify_name}]"
-
-                    # 货币映射：优先按财务货币ID关联，其次按货币代码（货币挂在银行卡名称上）
-                    ba_currency_id = ba_currency_by_finance_id.get(ea['currency_id'])
-                    if not ba_currency_id:
-                        ba_currency_id = ba_currency_by_code.get(
-                            (ea_currency_code.get(ea['currency_id'], '') or '').strip().upper()
-                        )
-                    result_row['进销存货币ID'] = ba_currency_id or ''
-                    if not ba_currency_id and ea['currency_id']:
-                        classify_warn += (
-                            f"[货币未匹配:{ea['currency_id']}/"
-                            f"{ea_currency_code.get(ea['currency_id'], '')}"
-                            f"{ea_currency_name.get(ea['currency_id'], '')},请先跑货币关联财务系统]"
-                        )
-
-                    candidates = [r for r in ba_by_name.get(name, []) if r['id'] not in used_ba_ids]
+                    # 先按代码匹配，代码匹配不上再按中文名匹配
+                    candidates = [r for r in ba_by_code.get(code.upper(), []) if r['id'] not in used_ba_ids]
+                    match_by = '代码'
+                    if not candidates and name:
+                        candidates = [r for r in ba_by_name.get(name, []) if r['id'] not in used_ba_ids]
+                        match_by = '名称'
 
                     if candidates:
                         ba_row = candidates[0]
                         used_ba_ids.add(ba_row['id'])
-                        result_row['进销存银行名称ID'] = ba_row['id']
-                        result_row['原关联财务ID'] = ba_row['finance_bankcard_id'] or ''
+                        result_row['进销存货币ID'] = ba_row['id']
+                        result_row['原关联财务ID'] = ba_row['finance_currency_id'] or ''
 
-                        need_bind = ba_row['finance_bankcard_id'] != ea['id']
-                        need_classify = bool(ba_classify_id) and ba_row['account_classify_id'] != ba_classify_id
-                        need_currency = bool(ba_currency_id) and ba_row['currency_id'] != ba_currency_id
-
-                        if not need_bind and not need_classify and not need_currency:
+                        if ba_row['finance_currency_id'] == ea['id']:
                             self.results['skip_count'] += 1
-                            result_row['处理状态'] = '跳过(已关联且分类货币一致)' + classify_warn
+                            result_row['处理状态'] = '跳过(已关联)'
                             self.results['completed_data'].append(result_row)
                             continue
 
                         if not self.preview_only:
-                            sets = ['finance_bankcard_id = %s']
-                            params = [ea['id']]
-                            if need_classify:
-                                sets.append('account_classify_id = %s')
-                                params.append(ba_classify_id)
-                            if need_currency:
-                                sets.append('currency_id = %s')
-                                params.append(ba_currency_id)
-                            sets.append('update_time = %s')
-                            params.append(now)
-                            params.append(ba_row['id'])
-                            target_cursor.execute(
-                                f"UPDATE ba_zhb_bank_name SET {', '.join(sets)} WHERE id = %s",
-                                params
-                            )
+                            target_cursor.execute("""
+                                UPDATE ba_currency
+                                SET finance_currency_id = %s, update_time = %s
+                                WHERE id = %s
+                            """, (ea['id'], now, ba_row['id']))
                             target_conn.commit()
 
-                        status_parts = []
-                        if need_bind:
-                            self.results['bind_count'] += 1
-                            if ba_row['finance_bankcard_id']:
-                                status_parts.append(
-                                    ('可改绑' if self.preview_only else '已改绑') +
-                                    f"(原财务ID={ba_row['finance_bankcard_id']})"
-                                )
-                            else:
-                                status_parts.append('可关联' if self.preview_only else '已关联')
-                        if need_classify:
-                            self.results['classify_update_count'] += 1
-                            status_parts.append(
-                                ('可更新账户分类' if self.preview_only else '已更新账户分类') +
-                                f"({ba_row['account_classify_id']}→{ba_classify_id})"
-                            )
-                        if need_currency:
-                            self.results['currency_update_count'] += 1
-                            status_parts.append(
-                                ('可更新货币' if self.preview_only else '已更新货币') +
-                                f"({ba_row['currency_id']}→{ba_currency_id})"
-                            )
-                        result_row['处理状态'] = '、'.join(status_parts) + classify_warn
+                        self.results['bind_count'] += 1
+                        if ba_row['finance_currency_id']:
+                            result_row['处理状态'] = ('可改绑' if self.preview_only else '已改绑') + \
+                                f"(原财务ID={ba_row['finance_currency_id']},按{match_by}匹配)"
+                        else:
+                            result_row['处理状态'] = ('可关联' if self.preview_only else '已关联') + f"(按{match_by}匹配)"
                         self.results['completed_data'].append(result_row)
                         continue
 
                     # 进销存没有 → 新增并绑定
-                    insert_classify_id = ba_classify_id or 1
-                    currency_code = ea_currency_code.get(ea['currency_id'], '')
-                    status = 1 if ea['status'] is None else int(ea['status'])
                     if not self.preview_only:
                         target_cursor.execute("""
-                            INSERT INTO ba_zhb_bank_name
-                                (bank_name, currency, currency_id, status, account_classify_id,
-                                 finance_bankcard_id, admin_id, admin_dept_id,
+                            INSERT INTO ba_currency
+                                (currency_cn, currency_en, status, finance_currency_id,
                                  create_time, update_time)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """, (name, currency_code, ba_currency_id, status, insert_classify_id,
-                              ea['id'], 1, 1, now, now))
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                        """, (name or code, code or name, 1, ea['id'], now, now))
                         target_conn.commit()
                         new_id = target_cursor.lastrowid
                         used_ba_ids.add(new_id)
-                        result_row['进销存银行名称ID'] = new_id
-                    result_row['进销存账户分类ID'] = insert_classify_id
+                        result_row['进销存货币ID'] = new_id
 
                     self.results['insert_count'] += 1
-                    result_row['处理状态'] = ('可新增并关联' if self.preview_only else '已新增并关联') + classify_warn
+                    result_row['处理状态'] = '可新增并关联' if self.preview_only else '已新增并关联'
                     self.results['completed_data'].append(result_row)
 
                 except Exception as e:
@@ -289,10 +178,12 @@ class BankNameLinkWorker(QThread):
                 self.progress.emit(15 + int((index + 1) / total * 80))
 
             # 进销存有、财务没有的（仅提示，不处理）
+            ea_codes = {(r['code'] or '').strip().upper() for r in ea_rows}
             ea_names = {(r['name'] or '').strip() for r in ea_rows}
             for row in ba_rows:
-                if (row['bank_name'] or '').strip() not in ea_names:
-                    self.log_message.emit(f"提示: 进销存银行名称「{row['bank_name']}」财务系统没有，未处理")
+                if (row['currency_en'] or '').strip().upper() not in ea_codes \
+                        and (row['currency_cn'] or '').strip() not in ea_names:
+                    self.log_message.emit(f"提示: 进销存货币「{row['currency_cn']}/{row['currency_en']}」财务系统没有，未处理")
 
             source_cursor.close()
             source_conn.close()
@@ -301,11 +192,9 @@ class BankNameLinkWorker(QThread):
 
             self.progress.emit(100)
             self.log_message.emit(f"\n=== {mode_text}完成 ===")
-            self.log_message.emit(f"财务银行名称总数: {total}")
+            self.log_message.emit(f"财务货币总数: {total}")
             self.log_message.emit(f"关联: {self.results['bind_count']}")
             self.log_message.emit(f"新增并关联: {self.results['insert_count']}")
-            self.log_message.emit(f"更新账户分类: {self.results['classify_update_count']}")
-            self.log_message.emit(f"更新货币: {self.results['currency_update_count']}")
             self.log_message.emit(f"跳过: {self.results['skip_count']}")
             self.log_message.emit(f"失败: {self.results['fail_count']}")
 
@@ -320,8 +209,8 @@ class BankNameLinkWorker(QThread):
             self.error.emit(str(e))
 
 
-class BankNameLinkWidget(QWidget):
-    """银行名称关联财务系统界面"""
+class CurrencyLinkWidget(QWidget):
+    """货币关联财务系统界面"""
 
     def __init__(self, db_manager=None):
         super().__init__()
@@ -362,19 +251,16 @@ class BankNameLinkWidget(QWidget):
         info_group = QGroupBox("功能说明")
         info_layout = QVBoxLayout()
         info_label = QLabel("""
-<b>银行名称关联财务系统说明:</b><br>
-<b>数据流向:</b> 财务系统(源) → 进销存(目标)，<b>以财务系统数据为主，以名称匹配</b><br><br>
+<b>货币关联财务系统说明:</b><br>
+<b>数据流向:</b> 财务系统(源) → 进销存(目标)，<b>以财务系统数据为主，按货币代码匹配</b><br><br>
 <b>处理逻辑:</b><br>
-• 遍历财务库 ea_dy_bankcard 中未删除的银行名称<br>
-• 按 name 匹配进销存 ba_zhb_bank_name.bank_name<br>
-• 匹配上：回写 finance_bankcard_id，并把账户分类、货币同步成财务的（以财务为主）<br>
-• 货币映射：ea_dy_bankcard.currency_id → ba_currency.finance_currency_id，
-匹配不到时退化为按货币代码匹配，仍匹配不到则不刷货币并在结果里标注<br>
-• 匹配不上：新增 ba_zhb_bank_name(bank_name/currency/status/account_classify_id) 并直接绑定<br>
-• 账户分类映射：ea_dy_bankcard.account_classify → ba_account_classify.finance_classify_id，
-匹配不到时退化为按分类名称匹配，仍匹配不到则新增记录用默认1并在结果里标注<br>
-• 进销存有、财务没有的银行名称：仅在日志提示，不处理<br><br>
-<b>注意:</b> 请先执行「货币关联财务系统」和「账户分类关联财务系统」，否则货币/账户分类可能映射不上！<br>
+• 遍历财务库 ea_dy_currency（该表只有 id/name/code，无时间字段）<br>
+• 按 code 匹配进销存 ba_currency.currency_en，匹配不上再按 name 匹配 currency_cn<br>
+• 匹配上：回写 ba_currency.finance_currency_id（已关联到其他ID会改绑并记录）<br>
+• 匹配不上：在进销存新增一条(currency_cn/currency_en)并直接绑定<br>
+• 进销存有、财务没有的货币：仅在日志提示，不处理<br><br>
+<b>注意:</b> 本功能和「账户分类关联财务系统」一样要最先跑；
+「银行名称关联财务系统」依赖这里的 finance_currency_id 才能把财务银行名称上的货币刷到进销存！<br>
 <b>建议先执行「预检查」确认结果后再执行「开始同步」</b>
         """)
         info_label.setWordWrap(True)
@@ -486,11 +372,10 @@ class BankNameLinkWidget(QWidget):
 
         reply = QMessageBox.question(
             self, "确认同步",
-            f"确定要按财务系统刷进销存银行名称吗？\n\n"
+            f"确定要按财务系统刷进销存货币吗？\n\n"
             f"进销存(目标): {target_ds.name}\n"
             f"财务系统(源): {source_ds.name}\n\n"
-            f"将回写 ba_zhb_bank_name.finance_bankcard_id、同步 account_classify_id，"
-            f"并新增财务有、进销存没有的银行名称\n"
+            f"将回写 ba_currency.finance_currency_id，并新增财务有、进销存没有的货币\n"
             f"操作不可撤销，请确认！",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No
         )
@@ -511,7 +396,7 @@ class BankNameLinkWidget(QWidget):
         self.completed_data = []
         self.failed_records = []
 
-        self.worker = BankNameLinkWorker(target_ds, source_ds, preview_only=preview_only)
+        self.worker = CurrencyLinkWorker(target_ds, source_ds, preview_only=preview_only)
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log_message.connect(self.append_log)
         self.worker.finished.connect(self.on_finished)
@@ -530,10 +415,9 @@ class BankNameLinkWidget(QWidget):
         self.completed_data = results.get('completed_data', [])
         self.failed_records = results.get('failed_records', [])
 
-        text = (f"财务银行名称{results['total']}条 | 关联: {results['bind_count']} | "
-                f"新增并关联: {results['insert_count']} | 更新分类: {results['classify_update_count']} | "
-                f"更新货币: {results['currency_update_count']} | "
-                f"跳过: {results['skip_count']} | 失败: {results['fail_count']}")
+        text = (f"财务货币{results['total']}条 | 关联: {results['bind_count']} | "
+                f"新增并关联: {results['insert_count']} | 跳过: {results['skip_count']} | "
+                f"失败: {results['fail_count']}")
         self.result_label.setStyleSheet("color: orange;" if results['fail_count'] else "color: green;")
         self.result_label.setText(text)
 
@@ -553,7 +437,7 @@ class BankNameLinkWidget(QWidget):
         if not self.completed_data:
             QMessageBox.warning(self, "警告", "没有可导出的数据！")
             return
-        default_name = f"银行名称关联完整记录_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        default_name = f"货币关联完整记录_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         path, _ = QFileDialog.getSaveFileName(self, "保存完整记录", default_name, "Excel文件 (*.xlsx)")
         if path:
             pd.DataFrame(self.completed_data).to_excel(path, index=False, engine='openpyxl')
@@ -563,7 +447,7 @@ class BankNameLinkWidget(QWidget):
         if not self.failed_records:
             QMessageBox.warning(self, "警告", "没有失败记录！")
             return
-        default_name = f"银行名称关联失败记录_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        default_name = f"货币关联失败记录_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         path, _ = QFileDialog.getSaveFileName(self, "保存失败记录", default_name, "Excel文件 (*.xlsx)")
         if path:
             pd.DataFrame(self.failed_records).to_excel(path, index=False, engine='openpyxl')
